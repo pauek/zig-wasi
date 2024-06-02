@@ -142,11 +142,13 @@ pub const ModuleReader = struct {
         var str_buf: [max_str_len]u8 = undefined;
 
         for (vm.imports) |*import| {
-            const mod = str_buf[0..try self.readULEB128(u32)];
+            const mod_size = try self.readULEB128(u32);
+            const mod = str_buf[0..mod_size];
             try self.readNoEof(mod);
             import.mod = std.meta.stringToEnum(VM.Import.Mod, mod).?;
 
-            const name = str_buf[0..try self.readULEB128(u32)];
+            const name_size = try self.readULEB128(u32);
+            const name = str_buf[0..name_size];
             try self.readNoEof(name);
             import.name = std.meta.stringToEnum(VM.Import.Name, name).?;
 
@@ -178,7 +180,8 @@ pub const ModuleReader = struct {
         if (table_count == 1) {
             assert(try self.readILEB128(i33) == -0x10);
             const limits_kind = try self.readByte();
-            vm.table = try self.allocator.alloc(u32, try self.readULEB128(u32));
+            const table_size = try self.readULEB128(u32);
+            vm.table = try self.allocator.alloc(u32, table_size);
             switch (limits_kind) {
                 0x00 => {},
                 0x01 => _ = try self.readULEB128(u32),
@@ -192,7 +195,8 @@ pub const ModuleReader = struct {
 
         assert(try self.readULEB128(u32) == 1);
         const limits_kind = try self.readByte();
-        vm.memory_len = try self.readULEB128(u32) * wasm.page_size;
+        const num_memories = try self.readULEB128(u32);
+        vm.memory_len = num_memories * wasm.page_size;
         switch (limits_kind) {
             0x00 => {},
             0x01 => _ = try self.readULEB128(u32),
@@ -270,8 +274,9 @@ pub const ModuleReader = struct {
                 offset += 1;
                 element_count -= 1;
             }) {
-                if (flags & 0b010 == 0b010)
+                if (flags & 0b010 == 0b010) {
                     assert(try self.readByte() == 0xD2);
+                }
                 vm.table[offset] = try self.readULEB128(u32);
                 if (flags & 0b010 == 0b010) {
                     const end_opcode: wasm.Opcode = @enumFromInt(try self.readByte());
@@ -320,7 +325,11 @@ pub const ModuleReader = struct {
             max_frame_size = @max(params_size + func.locals_size, max_frame_size);
 
             func.entry_pc = pc;
-            decode_log.debug("decoding func id {d} with pc {d}:{d}", .{ func.id, pc.opcode, pc.operand });
+            decode_log.debug("decoding func id {d} with pc {d}:{d}", .{
+                func.id,
+                pc.opcode,
+                pc.operand,
+            });
             try vm.decodeCode(self.c_reader, type_info, &pc, &stack);
         }
 
