@@ -1,6 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
-const read_module = @import("./reader.zig").read_module;
+const reader = @import("./reader.zig");
 const vm = @import("./vm/vm.zig");
 
 fn usage() void {
@@ -41,7 +41,8 @@ fn main_function(main_args: []const [*:0]const u8) !void {
 
     var machine = try vm.makeVirtualMachine(arena);
 
-    const start_fn_idx = try read_module(arena, &machine, args.wasm_file);
+    var rd = try reader.makeModuleReader(args.wasm_file);
+    const start_fn_idx = try rd.read(arena, &machine);
 
     machine.call(&machine.functions[start_fn_idx - @as(u32, @truncate(machine.imports.len))]);
     machine.run();
