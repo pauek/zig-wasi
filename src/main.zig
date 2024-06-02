@@ -1,23 +1,18 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const mem = std.mem;
-const wasm = std.wasm;
-const wasi = std.os.wasi;
-const os = std.os;
-const math = std.math;
-const leb = std.leb;
-const decode_log = std.log.scoped(.decode);
-const stats_log = std.log.scoped(.stats);
-const cpu_log = std.log.scoped(.cpu);
-const func_log = std.log.scoped(.func);
 const read_module = @import("./read_module.zig").read_module;
-const VirtualMachine = @import("./vm.zig").VirtualMachine;
+const vm = @import("./vm/vm.zig");
 
-const max_memory = 3 * 1024 * 1024; // 3 MiB
+fn usage() void {
+    std.debug.print("Usage: zig-wasi <file.wasm>\n", .{});
+}
 
 pub export fn main(argc: c_int, argv: [*c][*:0]u8) c_int {
-    _main(argv[0..@intCast(argc)]) catch |e| {
-        std.debug.print("{s}\n", .{@errorName(e)});
+    main_function(argv[0..@intCast(argc)]) catch |err| {
+        switch (err) {
+            ZigWasiError.WrongUsage => usage(),
+            else => std.debug.print("{s}\n", .{@errorName(err)}),
+        }
     };
     return 1;
 }
@@ -26,25 +21,28 @@ const ZigWasiError = error{
     WrongUsage,
 };
 
-fn _main(args: []const [*:0]const u8) !void {
-    if (args.len < 2) {
-        std.debug.print("Usage: zig-wasi <file.wasm>\n", .{});
+const ProgramArgs = struct { wasm_file: [*:0]const u8 };
+
+fn parseArgs(main_args: []const [*:0]const u8) !ProgramArgs {
+    var args: ProgramArgs = undefined;
+    if (main_args.len < 2) {
         return ZigWasiError.WrongUsage;
     }
+    args.wasm_file = main_args[1][0..];
+    return args;
+}
+
+fn main_function(main_args: []const [*:0]const u8) !void {
+    const args = try parseArgs(main_args);
 
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.raw_c_allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    var vm: VirtualMachine = undefined;
-    vm.memory = try arena.alloc(u8, max_memory);
+    var machine = try vm.makeVirtualMachine(arena);
 
-    const wasm_file = args[1];
+    const start_fn_idx = try read_module(arena, &machine, args.wasm_file);
 
-    const start_fn_idx = try read_module(arena, &vm, wasm_file);
-
-    vm.stack = try arena.alloc(u32, 10000000);
-    vm.stack_top = 0;
-    vm.call(&vm.functions[start_fn_idx - @as(u32, @truncate(vm.imports.len))]);
-    vm.run();
+    machine.call(&machine.functions[start_fn_idx - @as(u32, @truncate(machine.imports.len))]);
+    machine.run();
 }

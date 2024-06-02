@@ -4,7 +4,7 @@ const mem = std.mem;
 const wasm = std.wasm;
 const assert = std.debug.assert;
 const leb = std.leb;
-const VM = @import("./vm.zig");
+const VM = @import("./vm/vm.zig");
 const VirtualMachine = VM.VirtualMachine;
 const decode_log = std.log.scoped(.decode);
 const stats_log = std.log.scoped(.stats);
@@ -286,7 +286,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
 
         var opcode_counts = [1]u64{0} ** 0x100;
-        var prefix: ?VM.Opcode = null;
+        var prefix: ?VM.types.Opcode = null;
         for (vm.opcodes[0..pc.opcode]) |opcode| {
             if (prefix) |pre| {
                 switch (pre) {
