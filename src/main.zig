@@ -35,7 +35,7 @@ pub fn log(
 const max_memory = 3 * 1024 * 1024 * 1024; // 3 GiB
 
 pub export fn main(argc: c_int, argv: [*c][*:0]u8) c_int {
-    main2(argv[0..@intCast(usize, argc)]) catch |e| std.debug.print("{s}\n", .{@errorName(e)});
+    main2(argv[0..@intCast(argc)]) catch |e| std.debug.print("{s}\n", .{@errorName(e)});
     return 1;
 }
 
@@ -45,11 +45,11 @@ fn main2(args: []const [*:0]const u8) !void {
     const arena = arena_instance.allocator();
 
     var vm: VirtualMachine = undefined;
-    vm.memory = try os.mmap(
+    vm.memory = try std.posix.mmap(
         null,
         max_memory,
-        os.PROT.READ | os.PROT.WRITE,
-        os.MAP.PRIVATE | os.MAP.ANONYMOUS,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
     );
@@ -61,16 +61,17 @@ fn main2(args: []const [*:0]const u8) !void {
 
     const cwd = try fs.cwd().openDir(".", .{});
     const cache_dir = try cwd.makeOpenPath(zig_cache_dir_path, .{});
-    const zig_lib_dir = try cwd.openDirZ(zig_lib_dir_path, .{}, false);
+    const zig_lib_dir = try cwd.openDirZ(zig_lib_dir_path, .{});
 
-    addPreopen(0, "stdin", os.STDIN_FILENO);
-    addPreopen(1, "stdout", os.STDOUT_FILENO);
-    addPreopen(2, "stderr", os.STDERR_FILENO);
+    addPreopen(0, "stdin", std.posix.STDIN_FILENO);
+    addPreopen(1, "stdout", std.posix.STDOUT_FILENO);
+    addPreopen(2, "stderr", std.posix.STDERR_FILENO);
     addPreopen(3, ".", cwd.fd);
     addPreopen(4, "/cache", cache_dir.fd);
     addPreopen(5, "/lib", zig_lib_dir.fd);
 
     var start_fn_idx: u32 = undefined;
+    var section_type: wasm.Section = undefined;
     {
         const module_file = std.c.fopen(wasm_file, "rb") orelse return error.FileNotFound;
         defer _ = std.c.fclose(module_file);
@@ -80,11 +81,12 @@ fn main2(args: []const [*:0]const u8) !void {
         try module_reader.readNoEof(&magic);
         if (!mem.eql(u8, &magic, "\x00asm")) return error.NotWasm;
 
-        const version = try module_reader.readIntLittle(u32);
+        const version = try module_reader.readVarInt(u32, std.builtin.Endian.little, 1);
         if (version != 1) return error.BadWasmVersion;
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .type)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .type)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         var max_param_count: u64 = 0;
@@ -120,8 +122,9 @@ fn main2(args: []const [*:0]const u8) !void {
             }
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .import)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .import)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
@@ -144,7 +147,7 @@ fn main2(args: []const [*:0]const u8) !void {
                 try module_reader.readNoEof(name);
                 import.name = std.meta.stringToEnum(Import.Name, name).?;
 
-                const kind = @intToEnum(wasm.ExternalKind, try module_reader.readByte());
+                const kind: wasm.ExternalKind = @enumFromInt(try module_reader.readByte());
                 const idx = try leb.readULEB128(u32, module_reader);
                 switch (kind) {
                     .function => import.type_idx = idx,
@@ -153,18 +156,22 @@ fn main2(args: []const [*:0]const u8) !void {
             }
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .function)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .function)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         vm.functions = try arena.alloc(Function, try leb.readULEB128(u32, module_reader));
-        for (vm.functions) |*function, func_idx| {
-            function.id = @intCast(u32, vm.imports.len + func_idx);
+        for (vm.functions, 0..) |*function, func_idx| {
+            const len: u32 = @truncate(vm.imports.len);
+            const idx: u32 = @truncate(func_idx);
+            function.id = len + idx;
             function.type_idx = try leb.readULEB128(u32, module_reader);
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .table)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .table)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
@@ -181,8 +188,9 @@ fn main2(args: []const [*:0]const u8) !void {
             } else assert(table_count == 0);
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .memory)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .memory)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
@@ -196,21 +204,25 @@ fn main2(args: []const [*:0]const u8) !void {
             }
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .global)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .global)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         vm.globals = try arena.alloc(u32, try leb.readULEB128(u32, module_reader));
         for (vm.globals) |*global| {
             assert(try leb.readILEB128(i33, module_reader) == -1);
-            _ = @intToEnum(Mutability, try module_reader.readByte());
-            assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .i32_const);
-            global.* = @bitCast(u32, try leb.readILEB128(i32, module_reader));
-            assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .end);
+            _ = try module_reader.readByte();
+            const global_type: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+            assert(global_type == .i32_const);
+            global.* = @intCast(try leb.readILEB128(i32, module_reader));
+            const opcode: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+            assert(opcode == .end);
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .@"export")
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .@"export")
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
@@ -226,9 +238,9 @@ fn main2(args: []const [*:0]const u8) !void {
                     try module_reader.readNoEof(&str_buf);
                     is_start_fn = mem.eql(u8, &str_buf, start_name);
                     found_start_fn = found_start_fn or is_start_fn;
-                } else assert(fseek(module_file, @intCast(c_long, name_len), .CUR) == 0);
+                } else assert(fseek(module_file, @as(c_long, name_len), .CUR) == 0);
 
-                const kind = @intToEnum(wasm.ExternalKind, try module_reader.readByte());
+                const kind: wasm.ExternalKind = @enumFromInt(try module_reader.readByte());
                 const idx = try leb.readULEB128(u32, module_reader);
                 switch (kind) {
                     .function => if (is_start_fn) {
@@ -240,20 +252,23 @@ fn main2(args: []const [*:0]const u8) !void {
             assert(found_start_fn);
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .element)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .element)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
             var segment_count = try leb.readULEB128(u32, module_reader);
             while (segment_count > 0) : (segment_count -= 1) {
-                const flags = @intCast(u3, try leb.readULEB128(u32, module_reader));
+                const flags: u32 = @intCast(try leb.readULEB128(u32, module_reader));
                 assert(flags & 0b001 == 0b000);
                 if (flags & 0b010 == 0b010) assert(try leb.readULEB128(u32, module_reader) == 0);
 
-                assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .i32_const);
-                var offset = @bitCast(u32, try leb.readILEB128(i32, module_reader));
-                assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .end);
+                const opcode: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+                assert(opcode == .i32_const);
+                var offset: u32 = @intCast(try leb.readILEB128(i32, module_reader));
+                const end: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+                assert(end == .end);
 
                 const element_type = if (flags & 0b110 != 0b110) idx: {
                     if (flags & 0b010 == 0b010) assert(try module_reader.readByte() == 0x00);
@@ -269,14 +284,17 @@ fn main2(args: []const [*:0]const u8) !void {
                     if (flags & 0b010 == 0b010)
                         assert(try module_reader.readByte() == 0xD2);
                     vm.table[offset] = try leb.readULEB128(u32, module_reader);
-                    if (flags & 0b010 == 0b010)
-                        assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .end);
+                    if (flags & 0b010 == 0b010) {
+                        const end_opcode: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+                        assert(end_opcode == .end);
+                    }
                 }
             }
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .code)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .code)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         var max_frame_size: u64 = 0;
@@ -293,10 +311,12 @@ fn main2(args: []const [*:0]const u8) !void {
                 stack = .{};
                 const type_info = vm.types[func.type_idx];
                 var param_i: u32 = 0;
-                while (param_i < type_info.param_count) : (param_i += 1) stack.push(@intToEnum(
-                    StackInfo.EntryType,
-                    @boolToInt(type_info.param_types.isSet(param_i)),
-                ));
+                while (param_i < type_info.param_count) : (param_i += 1) {
+                    const entry_type: StackInfo.EntryType = @enumFromInt(
+                        @intFromBool(type_info.param_types.isSet(param_i)),
+                    );
+                    stack.push(entry_type);
+                }
                 const params_size = stack.top_offset;
 
                 var local_sets_count = try leb.readULEB128(u32, module_reader);
@@ -326,16 +346,18 @@ fn main2(args: []const [*:0]const u8) !void {
                         else => unreachable,
                     }
                     prefix = null;
-                } else switch (@intToEnum(Opcode, opcode)) {
-                    else => opcode_counts[opcode] += 1,
+                } else {
+                    opcode_counts[opcode] += 1;
                 }
             }
 
             stats_log.debug("{} opcodes", .{pc.opcode});
             stats_log.debug("{} operands", .{pc.operand});
-            for (opcode_counts) |opcode_count, opcode| {
-                if (opcode > @enumToInt(Opcode.last)) continue;
-                stats_log.debug("{} {s}", .{ opcode_count, @tagName(@intToEnum(Opcode, opcode)) });
+            for (opcode_counts, 0..) |opcode_count, opcode| {
+                const last_opcode: usize = @intFromEnum(Opcode.last);
+                if (opcode > last_opcode) continue;
+                const opcode_enum: Opcode = @enumFromInt(opcode);
+                stats_log.debug("{} {s}", .{ opcode_count, @tagName(opcode_enum) });
             }
             stats_log.debug("{} zero offsets", .{offset_counts[0]});
             stats_log.debug("{} non-zero offsets", .{offset_counts[1]});
@@ -345,20 +367,24 @@ fn main2(args: []const [*:0]const u8) !void {
             stats_log.debug("{} max param count", .{max_param_count});
         }
 
-        while (@intToEnum(wasm.Section, try module_reader.readByte()) != .data)
-            assert(fseek(module_file, @intCast(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
+        section_type = @enumFromInt(try module_reader.readByte());
+        while (section_type != .data)
+            assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
         _ = try leb.readULEB128(u32, module_reader);
 
         {
             var segment_count = try leb.readULEB128(u32, module_reader);
             while (segment_count > 0) : (segment_count -= 1) {
-                const flags = @intCast(u2, try leb.readULEB128(u32, module_reader));
+                const flags = @as(u32, try leb.readULEB128(u32, module_reader));
                 assert(flags & 0b001 == 0b000);
                 if (flags & 0b010 == 0b010) assert(try leb.readULEB128(u32, module_reader) == 0);
 
-                assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .i32_const);
-                const offset = @bitCast(u32, try leb.readILEB128(i32, module_reader));
-                assert(@intToEnum(wasm.Opcode, try module_reader.readByte()) == .end);
+                const i32_const: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+                assert(i32_const == .i32_const);
+
+                const offset = @as(u32, @bitCast(try leb.readILEB128(i32, module_reader)));
+                const end: wasm.Opcode = @enumFromInt(try module_reader.readByte());
+                assert(end == .end);
 
                 const length = try leb.readULEB128(u32, module_reader);
                 try module_reader.readNoEof(vm.memory[offset..][0..length]);
@@ -368,7 +394,7 @@ fn main2(args: []const [*:0]const u8) !void {
 
     vm.stack = try arena.alloc(u32, 10000000);
     vm.stack_top = 0;
-    vm.call(&vm.functions[start_fn_idx - @intCast(u32, vm.imports.len)]);
+    vm.call(&vm.functions[start_fn_idx - @as(u32, @truncate(vm.imports.len))]);
     vm.run();
 }
 
@@ -669,7 +695,7 @@ const StackInfo = struct {
         }
 
         fn fromBool(self: bool) EntryType {
-            return @intToEnum(EntryType, @boolToInt(self));
+            return @enumFromInt(@intFromBool(self));
         }
     };
     const max_stack_depth = 1 << 12;
@@ -748,26 +774,28 @@ const VirtualMachine = struct {
         while (true) {
             assert(stack.top_index >= labels[0].stack_index);
             assert(stack.top_offset >= labels[0].stack_offset);
-            const opcode = try reader.readByte();
-            var prefixed_opcode: u8 = if (@intToEnum(wasm.Opcode, opcode) == .prefixed)
-                @intCast(u8, try leb.readULEB128(u32, reader))
+            const opcode_byte = try reader.readByte();
+            const opcode_enum: wasm.Opcode = @enumFromInt(opcode_byte);
+            const prefixed_opcode: u8 = if (opcode_enum == .misc_prefix)
+                @truncate(try leb.readULEB128(u32, reader))
             else
                 undefined;
 
             //decode_log.debug("stack.top_index = {}, stack.top_offset = {}, opcode = {s}, prefixed_opcode = {s}", .{
             //    stack.top_index,
             //    stack.top_offset,
-            //    @tagName(@intToEnum(wasm.Opcode, opcode)),
-            //    if (@intToEnum(wasm.Opcode, opcode) == .prefixed)
-            //        @tagName(@intToEnum(wasm.PrefixedOpcode, prefixed_opcode))
+            //    @tagName(@enumFromInt(wasm.Opcode, opcode)),
+            //    if (@enumFromInt(wasm.Opcode, opcode) == .prefixed)
+            //        @tagName(@enumFromInt(wasm.PrefixedOpcode, prefixed_opcode))
             //    else
             //        "(none)",
             //});
 
-            decode_log.debug("decodeCode opcode=0x{x} pc={d}:{d}", .{ opcode, pc.opcode, pc.operand });
+            decode_log.debug("decodeCode opcode=0x{x} pc={d}:{d}", .{ opcode_byte, pc.opcode, pc.operand });
             const old_pc = pc.*;
+            const prefixed_enum: wasm.MiscOpcode = @enumFromInt(prefixed_opcode);
 
-            if (unreachable_depth == 0) switch (@intToEnum(wasm.Opcode, opcode)) {
+            if (unreachable_depth == 0) switch (opcode_enum) {
                 .@"unreachable",
                 .nop,
                 .block,
@@ -1017,7 +1045,7 @@ const VirtualMachine = struct {
                     stack.push(.i64);
                 },
 
-                .prefixed => switch (@intToEnum(wasm.PrefixedOpcode, prefixed_opcode)) {
+                .misc_prefix => switch (prefixed_enum) {
                     .i32_trunc_sat_f32_s,
                     .i32_trunc_sat_f32_u,
                     => {
@@ -1078,11 +1106,13 @@ const VirtualMachine = struct {
                     _ => unreachable,
                 },
 
+                .simd_prefix => unreachable,
+                .atomics_prefix => unreachable,
                 _ => unreachable,
             };
-            switch (@intToEnum(wasm.Opcode, opcode)) {
+            switch (opcode_enum) {
                 .@"unreachable" => if (unreachable_depth == 0) {
-                    opcodes[pc.opcode] = @enumToInt(Opcode.@"unreachable");
+                    opcodes[pc.opcode] = @intFromEnum(Opcode.@"unreachable");
                     pc.opcode += 1;
                     unreachable_depth += 1;
                 },
@@ -1101,13 +1131,13 @@ const VirtualMachine = struct {
                         const type_info = if (block_type < 0) TypeInfo{
                             .param_count = 0,
                             .param_types = TypeInfo.ParamTypes.initEmpty(),
-                            .result_count = @boolToInt(block_type != -0x40),
+                            .result_count = @intFromBool(block_type != -0x40),
                             .result_types = switch (block_type) {
                                 -0x40, -1, -3 => TypeInfo.ResultTypes.initEmpty(),
                                 -2, -4 => TypeInfo.ResultTypes.initFull(),
                                 else => unreachable,
                             },
-                        } else vm.types[@intCast(u32, block_type)];
+                        } else vm.types[@intCast(block_type)];
 
                         var param_i = type_info.param_count;
                         while (param_i > 0) {
@@ -1135,7 +1165,7 @@ const VirtualMachine = struct {
                             .@"if" => {
                                 const bool_not = state == .bool_not;
                                 if (bool_not) pc.opcode -= 1;
-                                opcodes[pc.opcode] = @enumToInt(if (bool_not)
+                                opcodes[pc.opcode] = @intFromEnum(if (bool_not)
                                     Opcode.br_nez_void
                                 else
                                     Opcode.br_eqz_void);
@@ -1163,7 +1193,7 @@ const VirtualMachine = struct {
                         assert(stack.top_index == label.stack_index);
                         assert(stack.top_offset == label.stack_offset);
 
-                        opcodes[pc.opcode] = @enumToInt(switch (operand_count) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (operand_count) {
                             0 => Opcode.br_void,
                             1 => switch (label.operandType(0)) {
                                 .i32 => Opcode.br_32,
@@ -1221,7 +1251,7 @@ const VirtualMachine = struct {
                             assert(stack.top_index == label.stack_index);
                             assert(stack.top_offset == label.stack_offset);
 
-                            opcodes[pc.opcode] = @enumToInt(switch (labels[0].type_info.result_count) {
+                            opcodes[pc.opcode] = @intFromEnum(switch (labels[0].type_info.result_count) {
                                 0 => Opcode.return_void,
                                 1 => switch (StackInfo.EntryType.fromBool(
                                     labels[0].type_info.result_types.isSet(0),
@@ -1263,7 +1293,7 @@ const VirtualMachine = struct {
 
                         const bool_not = state == .bool_not and opc == .br_if;
                         if (bool_not) pc.opcode -= 1;
-                        opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                             .br => switch (operand_count) {
                                 0 => Opcode.br_void,
                                 1 => switch (label.operandType(0)) {
@@ -1311,7 +1341,7 @@ const VirtualMachine = struct {
                                 stack.pop(label.operandType(operand_i));
                             }
 
-                            opcodes[pc.opcode] = @enumToInt(switch (operand_count) {
+                            opcodes[pc.opcode] = @intFromEnum(switch (operand_count) {
                                 0 => Opcode.br_table_void,
                                 1 => switch (label.operandType(0)) {
                                     .i32 => Opcode.br_table_32,
@@ -1339,7 +1369,7 @@ const VirtualMachine = struct {
                         ));
                     }
 
-                    opcodes[pc.opcode] = @enumToInt(switch (labels[0].type_info.result_count) {
+                    opcodes[pc.opcode] = @intFromEnum(switch (labels[0].type_info.result_count) {
                         0 => Opcode.return_void,
                         1 => switch (StackInfo.EntryType.fromBool(
                             labels[0].type_info.result_types.isSet(0),
@@ -1360,13 +1390,13 @@ const VirtualMachine = struct {
                     if (unreachable_depth == 0) {
                         const type_info = &vm.types[
                             if (fn_id < vm.imports.len) type_idx: {
-                                opcodes[pc.opcode + 0] = @enumToInt(Opcode.call_import);
-                                opcodes[pc.opcode + 1] = @intCast(u8, fn_id);
+                                opcodes[pc.opcode + 0] = @intFromEnum(Opcode.call_import);
+                                opcodes[pc.opcode + 1] = @truncate(fn_id);
                                 pc.opcode += 2;
                                 break :type_idx vm.imports[fn_id].type_idx;
                             } else type_idx: {
-                                const fn_idx = fn_id - @intCast(u32, vm.imports.len);
-                                opcodes[pc.opcode] = @enumToInt(Opcode.call_func);
+                                const fn_idx = fn_id - @as(u32, @truncate(vm.imports.len));
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.call_func);
                                 pc.opcode += 1;
                                 operands[pc.operand] = fn_idx;
                                 pc.operand += 1;
@@ -1392,7 +1422,7 @@ const VirtualMachine = struct {
                     const type_idx = try leb.readULEB128(u32, reader);
                     assert(try leb.readULEB128(u32, reader) == 0);
                     if (unreachable_depth == 0) {
-                        opcodes[pc.opcode] = @enumToInt(Opcode.call_indirect);
+                        opcodes[pc.opcode] = @intFromEnum(Opcode.call_indirect);
                         pc.opcode += 1;
 
                         const type_info = &vm.types[type_idx];
@@ -1420,7 +1450,7 @@ const VirtualMachine = struct {
                         stack.pop(operand_type);
                         stack.push(operand_type);
                     }
-                    opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                    opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                         .select => switch (operand_type) {
                             .i32 => Opcode.select_32,
                             .i64 => Opcode.select_64,
@@ -1440,7 +1470,7 @@ const VirtualMachine = struct {
                     const local_idx = try leb.readULEB128(u32, reader);
                     if (unreachable_depth == 0) {
                         const local_type = stack.local(local_idx);
-                        opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                             .local_get => switch (local_type) {
                                 .i32 => Opcode.local_get_32,
                                 .i64 => Opcode.local_get_64,
@@ -1475,7 +1505,7 @@ const VirtualMachine = struct {
                     const global_idx = try leb.readULEB128(u32, reader);
                     if (unreachable_depth == 0) {
                         const global_type = StackInfo.EntryType.i32; // all globals assumed to be i32
-                        opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                             .global_get => switch (global_idx) {
                                 0 => Opcode.global_get_0_32,
                                 else => Opcode.global_get_32,
@@ -1529,11 +1559,11 @@ const VirtualMachine = struct {
                         switch (opc) {
                             else => {},
                             .i64_store8, .i64_store16, .i64_store32 => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.drop_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.drop_32);
                                 pc.opcode += 1;
                             },
                         }
-                        opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                             .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u => switch (offset) {
                                 0 => Opcode.load_0_8,
                                 else => Opcode.load_8,
@@ -1579,27 +1609,27 @@ const VirtualMachine = struct {
                         switch (opc) {
                             else => {},
                             .i32_load8_s, .i64_load8_s => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.sext8_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.sext8_32);
                                 pc.opcode += 1;
                             },
                             .i32_load16_s, .i64_load16_s => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.sext16_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.sext16_32);
                                 pc.opcode += 1;
                             },
                         }
                         switch (opc) {
                             else => {},
                             .i64_load8_s, .i64_load16_s, .i64_load32_s => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.sext_64_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.sext_64_32);
                                 pc.opcode += 1;
                             },
                             .i64_load8_u, .i64_load16_u, .i64_load32_u => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.zext_64_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.zext_64_32);
                                 pc.opcode += 1;
                             },
                         }
 
-                        offset_counts[@boolToInt(offset != 0)] += 1;
+                        offset_counts[@intFromBool(offset != 0)] += 1;
                         max_offset = @max(offset, max_offset);
                     }
                 },
@@ -1608,7 +1638,7 @@ const VirtualMachine = struct {
                 => |opc| {
                     assert(try reader.readByte() == 0);
                     if (unreachable_depth == 0) {
-                        opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                        opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                             .memory_size => Opcode.mem_size,
                             .memory_grow => Opcode.mem_grow,
                             else => unreachable,
@@ -1620,20 +1650,20 @@ const VirtualMachine = struct {
                 .f32_const,
                 => |opc| {
                     const value = switch (opc) {
-                        .i32_const => @bitCast(u32, try leb.readILEB128(i32, reader)),
-                        .f32_const => try reader.readIntLittle(u32),
+                        .i32_const => @as(u32, @bitCast(try leb.readILEB128(i32, reader))),
+                        .f32_const => try reader.readVarInt(u32, .little, 4),
                         else => unreachable,
                     };
                     if (unreachable_depth == 0) {
                         switch (value) {
-                            0 => opcodes[pc.opcode] = @enumToInt(Opcode.const_0_32),
-                            1 => opcodes[pc.opcode] = @enumToInt(Opcode.const_1_32),
+                            0 => opcodes[pc.opcode] = @intFromEnum(Opcode.const_0_32),
+                            1 => opcodes[pc.opcode] = @intFromEnum(Opcode.const_1_32),
                             else => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.const_32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.const_32);
                                 operands[pc.operand] = value;
                                 pc.operand += 1;
                             },
-                            math.maxInt(u32) => opcodes[pc.opcode] = @enumToInt(Opcode.const_umax_32),
+                            // math.maxInt(i32) => opcodes[pc.opcode] = @intFromEnum(Opcode.const_umax_32),
                         }
                         pc.opcode += 1;
                     }
@@ -1642,27 +1672,27 @@ const VirtualMachine = struct {
                 .f64_const,
                 => |opc| {
                     const value = switch (opc) {
-                        .i64_const => @bitCast(u64, try leb.readILEB128(i64, reader)),
-                        .f64_const => try reader.readIntLittle(u64),
+                        .i64_const => @as(u64, @bitCast(try leb.readILEB128(i64, reader))),
+                        .f64_const => try reader.readVarInt(u64, .little, 8),
                         else => unreachable,
                     };
                     if (unreachable_depth == 0) {
                         switch (value) {
-                            0 => opcodes[pc.opcode] = @enumToInt(Opcode.const_0_64),
-                            1 => opcodes[pc.opcode] = @enumToInt(Opcode.const_1_64),
+                            0 => opcodes[pc.opcode] = @intFromEnum(Opcode.const_0_64),
+                            1 => opcodes[pc.opcode] = @intFromEnum(Opcode.const_1_64),
                             else => {
-                                opcodes[pc.opcode] = @enumToInt(Opcode.const_64);
-                                operands[pc.operand + 0] = @truncate(u32, value >> 0);
-                                operands[pc.operand + 1] = @truncate(u32, value >> 32);
+                                opcodes[pc.opcode] = @intFromEnum(Opcode.const_64);
+                                operands[pc.operand + 0] = @truncate(value >> 0);
+                                operands[pc.operand + 1] = @truncate(value >> 32);
                                 pc.operand += 2;
                             },
-                            math.maxInt(u64) => opcodes[pc.opcode] = @enumToInt(Opcode.const_umax_64),
+                            math.maxInt(u64) => opcodes[pc.opcode] = @intFromEnum(Opcode.const_umax_64),
                         }
                         pc.opcode += 1;
                     }
                 },
                 else => |opc| if (unreachable_depth == 0) {
-                    opcodes[pc.opcode] = @enumToInt(switch (opc) {
+                    opcodes[pc.opcode] = @intFromEnum(switch (opc) {
                         .i32_eqz => Opcode.eqz_32,
                         .i32_eq => Opcode.eq_32,
                         .i32_ne => Opcode.ne_32,
@@ -1791,33 +1821,33 @@ const VirtualMachine = struct {
                     });
                     pc.opcode += 1;
                 },
-                .prefixed => switch (@intToEnum(wasm.PrefixedOpcode, prefixed_opcode)) {
+                .misc_prefix => switch (prefixed_enum) {
                     .memory_copy => {
                         assert(try reader.readByte() == 0 and try reader.readByte() == 0);
                         if (unreachable_depth == 0) {
-                            opcodes[pc.opcode] = @enumToInt(Opcode.memcpy);
+                            opcodes[pc.opcode] = @intFromEnum(Opcode.memcpy);
                             pc.opcode += 1;
                         }
                     },
                     .memory_fill => {
                         assert(try reader.readByte() == 0);
                         if (unreachable_depth == 0) {
-                            opcodes[pc.opcode] = @enumToInt(Opcode.memset);
+                            opcodes[pc.opcode] = @intFromEnum(Opcode.memset);
                             pc.opcode += 1;
                         }
                     },
                     else => unreachable,
                 },
             }
-            state = switch (@intToEnum(wasm.Opcode, opcode)) {
+            state = switch (opcode_enum) {
                 else => .default,
                 .i32_eqz => .bool_not,
             };
 
-            for (opcodes[old_pc.opcode..pc.opcode]) |o, i| {
+            for (opcodes[old_pc.opcode..pc.opcode], 0..) |o, i| {
                 decode_log.debug("decoded opcode[{d}] = {d}", .{ old_pc.opcode + i, o });
             }
-            for (operands[old_pc.operand..pc.operand]) |o, i| {
+            for (operands[old_pc.operand..pc.operand], 0..) |o, i| {
                 decode_log.debug("decoded operand[{d}] = {d}", .{ old_pc.operand + i, o });
             }
         }
@@ -1855,7 +1885,7 @@ const VirtualMachine = struct {
         });
 
         // Push zeroed locals to stack
-        mem.set(u32, vm.stack[vm.stack_top..][0..func.locals_size], 0);
+        @memset(vm.stack[vm.stack_top..][0..func.locals_size], 0);
         vm.stack_top += func.locals_size;
 
         vm.push(u32, vm.pc.opcode);
@@ -1870,34 +1900,34 @@ const VirtualMachine = struct {
                 .fd_prestat_get => {
                     const buf = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_prestat_get(vm, fd, buf)));
+                    vm.push(u32, @intFromEnum(wasi_fd_prestat_get(vm, fd, buf)));
                 },
                 .fd_prestat_dir_name => {
                     const path_len = vm.pop(u32);
                     const path = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_prestat_dir_name(vm, fd, path, path_len)));
+                    vm.push(u32, @intFromEnum(wasi_fd_prestat_dir_name(vm, fd, path, path_len)));
                 },
                 .fd_close => {
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_close(vm, fd)));
+                    vm.push(u32, @intFromEnum(wasi_fd_close(vm, fd)));
                 },
                 .fd_read => {
                     const nread = vm.pop(u32);
                     const iovs_len = vm.pop(u32);
                     const iovs = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_read(vm, fd, iovs, iovs_len, nread)));
+                    vm.push(u32, @intFromEnum(wasi_fd_read(vm, fd, iovs, iovs_len, nread)));
                 },
                 .fd_filestat_get => {
                     const buf = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_filestat_get(vm, fd, buf)));
+                    vm.push(u32, @intFromEnum(wasi_fd_filestat_get(vm, fd, buf)));
                 },
                 .fd_filestat_set_size => {
                     const size = vm.pop(u64);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_filestat_set_size(vm, fd, size)));
+                    vm.push(u32, @intFromEnum(wasi_fd_filestat_set_size(vm, fd, size)));
                 },
                 .fd_filestat_set_times => {
                     @panic("TODO implement fd_filestat_set_times");
@@ -1905,7 +1935,7 @@ const VirtualMachine = struct {
                 .fd_fdstat_get => {
                     const buf = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_fdstat_get(vm, fd, buf)));
+                    vm.push(u32, @intFromEnum(wasi_fd_fdstat_get(vm, fd, buf)));
                 },
                 .fd_readdir => {
                     @panic("TODO implement fd_readdir");
@@ -1915,7 +1945,7 @@ const VirtualMachine = struct {
                     const iovs_len = vm.pop(u32);
                     const iovs = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_write(vm, fd, iovs, iovs_len, nwritten)));
+                    vm.push(u32, @intFromEnum(wasi_fd_write(vm, fd, iovs, iovs_len, nwritten)));
                 },
                 .fd_pwrite => {
                     const nwritten = vm.pop(u32);
@@ -1923,27 +1953,27 @@ const VirtualMachine = struct {
                     const iovs_len = vm.pop(u32);
                     const iovs = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_fd_pwrite(vm, fd, iovs, iovs_len, offset, nwritten)));
+                    vm.push(u32, @intFromEnum(wasi_fd_pwrite(vm, fd, iovs, iovs_len, offset, nwritten)));
                 },
                 .proc_exit => {
                     stats_log.debug("memory length = {}\n", .{vm.memory_len});
-                    std.c.exit(@intCast(c_int, vm.pop(wasi.exitcode_t)));
+                    std.c.exit(@as(c_int, @intCast(vm.pop(wasi.exitcode_t))));
                     unreachable;
                 },
                 .args_sizes_get => {
                     const argv_buf_size = vm.pop(u32);
                     const argc = vm.pop(u32);
-                    vm.push(u32, @enumToInt(wasi_args_sizes_get(vm, argc, argv_buf_size)));
+                    vm.push(u32, @intFromEnum(wasi_args_sizes_get(vm, argc, argv_buf_size)));
                 },
                 .args_get => {
                     const argv_buf = vm.pop(u32);
                     const argv = vm.pop(u32);
-                    vm.push(u32, @enumToInt(wasi_args_get(vm, argv, argv_buf)));
+                    vm.push(u32, @intFromEnum(wasi_args_get(vm, argv, argv_buf)));
                 },
                 .random_get => {
                     const buf_len = vm.pop(u32);
                     const buf = vm.pop(u32);
-                    vm.push(u32, @enumToInt(wasi_random_get(vm, buf, buf_len)));
+                    vm.push(u32, @intFromEnum(wasi_random_get(vm, buf, buf_len)));
                 },
                 .environ_sizes_get => {
                     @panic("TODO implement environ_sizes_get");
@@ -1955,15 +1985,16 @@ const VirtualMachine = struct {
                     const buf = vm.pop(u32);
                     const path_len = vm.pop(u32);
                     const path = vm.pop(u32);
-                    const flags = vm.pop(u32);
+                    const flags: wasi.lookupflags_t = @bitCast(vm.pop(u32));
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_path_filestat_get(vm, fd, flags, path, path_len, buf)));
+                    const result: u16 = @intFromEnum(wasi_path_filestat_get(vm, fd, flags, path, path_len, buf));
+                    vm.push(u32, @intCast(result));
                 },
                 .path_create_directory => {
                     const path_len = vm.pop(u32);
                     const path = vm.pop(u32);
                     const fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_path_create_directory(vm, fd, path, path_len)));
+                    vm.push(u32, @intFromEnum(wasi_path_create_directory(vm, fd, path, path_len)));
                 },
                 .path_rename => {
                     const new_path_len = vm.pop(u32);
@@ -1972,7 +2003,7 @@ const VirtualMachine = struct {
                     const old_path_len = vm.pop(u32);
                     const old_path = vm.pop(u32);
                     const old_fd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_path_rename(
+                    vm.push(u32, @intFromEnum(wasi_path_rename(
                         vm,
                         old_fd,
                         old_path,
@@ -1984,24 +2015,24 @@ const VirtualMachine = struct {
                 },
                 .path_open => {
                     const fd = vm.pop(u32);
-                    const fs_flags = vm.pop(u32);
-                    const fs_rights_inheriting = vm.pop(u64);
-                    const fs_rights_base = vm.pop(u64);
-                    const oflags = vm.pop(u32);
+                    const fs_flags: wasi.fdflags_t = @bitCast(@as(u16, @truncate(vm.pop(u32))));
+                    const fs_rights_inheriting: wasi.rights_t = @bitCast(vm.pop(u64));
+                    const fs_rights_base: wasi.rights_t = @bitCast(vm.pop(u64));
+                    const oflags: wasi.oflags_t = @bitCast(@as(u16, @truncate(vm.pop(u32))));
                     const path_len = vm.pop(u32);
                     const path = vm.pop(u32);
-                    const dirflags = vm.pop(u32);
+                    const dirflags: wasi.lookupflags_t = @bitCast(vm.pop(u32));
                     const dirfd = vm.pop(i32);
-                    vm.push(u32, @enumToInt(wasi_path_open(
+                    vm.push(u32, @intFromEnum(wasi_path_open(
                         vm,
                         dirfd,
                         dirflags,
                         path,
                         path_len,
-                        @intCast(u16, oflags),
+                        oflags,
                         fs_rights_base,
                         fs_rights_inheriting,
-                        @intCast(u16, fs_flags),
+                        fs_flags,
                         fd,
                     )));
                 },
@@ -2014,8 +2045,8 @@ const VirtualMachine = struct {
                 .clock_time_get => {
                     const timestamp = vm.pop(u32);
                     const precision = vm.pop(u64);
-                    const clock_id = vm.pop(u32);
-                    vm.push(u32, @enumToInt(wasi_clock_time_get(vm, clock_id, precision, timestamp)));
+                    const clock_id: wasi.clockid_t = @enumFromInt(vm.pop(u32));
+                    vm.push(u32, @intFromEnum(wasi_clock_time_get(vm, clock_id, precision, timestamp)));
                 },
                 .fd_pread => {
                     @panic("TODO implement fd_pread");
@@ -2038,12 +2069,12 @@ const VirtualMachine = struct {
         if (@sizeOf(T) == 0) return;
         switch (@bitSizeOf(T)) {
             32 => {
-                vm.stack[vm.stack_top + 0] = @bitCast(u32, value);
+                vm.stack[vm.stack_top + 0] = @bitCast(value);
                 vm.stack_top += 1;
             },
             64 => {
-                vm.stack[vm.stack_top + 0] = @truncate(u32, @bitCast(u64, value) >> 0);
-                vm.stack[vm.stack_top + 1] = @truncate(u32, @bitCast(u64, value) >> 32);
+                vm.stack[vm.stack_top + 0] = @truncate(@as(u64, @bitCast(value)));
+                vm.stack[vm.stack_top + 1] = @truncate(@as(u64, @bitCast(value)) >> 32);
                 vm.stack_top += 2;
             },
             else => @compileError("bad push type"),
@@ -2055,11 +2086,11 @@ const VirtualMachine = struct {
         switch (@bitSizeOf(T)) {
             32 => {
                 vm.stack_top -= 1;
-                return @bitCast(T, vm.stack[vm.stack_top + 0]);
+                return @bitCast(vm.stack[vm.stack_top + 0]);
             },
             64 => {
                 vm.stack_top -= 2;
-                return @bitCast(T, vm.stack[vm.stack_top + 0] | @as(u64, vm.stack[vm.stack_top + 1]) << 32);
+                return @bitCast(vm.stack[vm.stack_top + 0] | @as(u64, vm.stack[vm.stack_top + 1]) << 32);
             },
             else => @compileError("bad pop type"),
         }
@@ -2072,7 +2103,7 @@ const VirtualMachine = struct {
         var global_0: u32 = vm.globals[0];
         defer vm.globals[0] = global_0;
         while (true) {
-            const op = @intToEnum(Opcode, opcodes[pc.opcode]);
+            const op: Opcode = @enumFromInt(opcodes[pc.opcode]);
             cpu_log.debug("stack[{d}:{d}]={x}:{x} pc={x}:{x} op={d}", .{
                 vm.stack_top - 2,
                 vm.stack_top - 1,
@@ -2080,7 +2111,7 @@ const VirtualMachine = struct {
                 vm.stack[vm.stack_top - 1],
                 pc.opcode,
                 pc.operand,
-                @enumToInt(op),
+                @intFromEnum(op),
             });
             cpu_log.debug("op={s}", .{@tagName(op)});
             pc.opcode += 1;
@@ -2176,7 +2207,7 @@ const VirtualMachine = struct {
                     if (fn_id < vm.imports.len)
                         vm.callImport(&vm.imports[fn_id])
                     else
-                        vm.call(&vm.functions[fn_id - @intCast(u32, vm.imports.len)]);
+                        vm.call(&vm.functions[fn_id - @as(u32, @truncate(vm.imports.len))]);
                 },
                 .drop_32 => {
                     vm.stack_top -= 1;
@@ -2201,7 +2232,7 @@ const VirtualMachine = struct {
                 .local_get_32 => {
                     const local = &vm.stack[vm.stack_top - operands[pc.operand]];
                     pc.operand += 1;
-                    vm.push(u32, @intCast(u32, local.*));
+                    vm.push(u32, @as(u32, local.*));
                 },
                 .local_get_64 => {
                     const local = vm.stack[vm.stack_top - operands[pc.operand] ..][0..2];
@@ -2217,8 +2248,8 @@ const VirtualMachine = struct {
                     const local = vm.stack[vm.stack_top - operands[pc.operand] ..][0..2];
                     pc.operand += 1;
                     const value = vm.pop(u64);
-                    local[0] = @truncate(u32, value >> 0);
-                    local[1] = @truncate(u32, value >> 32);
+                    local[0] = @truncate(value >> 0);
+                    local[1] = @truncate(value >> 32);
                 },
                 .local_tee_32 => {
                     const local = &vm.stack[vm.stack_top - operands[pc.operand]];
@@ -2258,82 +2289,82 @@ const VirtualMachine = struct {
                 },
                 .load_0_16 => {
                     const address = vm.pop(u32);
-                    vm.push(u32, mem.readIntLittle(u16, vm.memory[address..][0..2]));
+                    vm.push(u32, mem.readVarInt(u16, vm.memory[address..][0..2], .little));
                 },
                 .load_16 => {
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    vm.push(u32, mem.readIntLittle(u16, vm.memory[address..][0..2]));
+                    vm.push(u32, mem.readVarInt(u16, vm.memory[address..][0..2], .little));
                 },
                 .load_0_32 => {
                     const address = vm.pop(u32);
-                    vm.push(u32, mem.readIntLittle(u32, vm.memory[address..][0..4]));
+                    vm.push(u32, mem.readVarInt(u32, vm.memory[address..][0..4], .little));
                 },
                 .load_32 => {
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    vm.push(u32, mem.readIntLittle(u32, vm.memory[address..][0..4]));
+                    vm.push(u32, mem.readVarInt(u32, vm.memory[address..][0..4], .little));
                 },
                 .load_0_64 => {
                     const address = vm.pop(u32);
-                    vm.push(u64, mem.readIntLittle(u64, vm.memory[address..][0..8]));
+                    vm.push(u64, mem.readVarInt(u64, vm.memory[address..][0..8], .little));
                 },
                 .load_64 => {
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    vm.push(u64, mem.readIntLittle(u64, vm.memory[address..][0..8]));
+                    vm.push(u64, mem.readVarInt(u64, vm.memory[address..][0..8], .little));
                 },
                 .store_0_8 => {
-                    const value = @truncate(u8, vm.pop(u32));
+                    const value: u8 = @truncate(vm.pop(u32));
                     const address = vm.pop(u32);
                     vm.memory[address] = value;
                 },
                 .store_8 => {
-                    const value = @truncate(u8, vm.pop(u32));
+                    const value: u8 = @truncate(vm.pop(u32));
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
                     vm.memory[address] = value;
                 },
                 .store_0_16 => {
-                    const value = @truncate(u16, vm.pop(u32));
+                    const value: u16 = @truncate(vm.pop(u32));
                     const address = vm.pop(u32);
-                    mem.writeIntLittle(u16, vm.memory[address..][0..2], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..2], 0, 16, value, .little);
                 },
                 .store_16 => {
-                    const value = @truncate(u16, vm.pop(u32));
+                    const value: u16 = @truncate(vm.pop(u32));
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    mem.writeIntLittle(u16, vm.memory[address..][0..2], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..2], 0, 16, value, .little);
                 },
                 .store_0_32 => {
                     const value = vm.pop(u32);
                     const address = vm.pop(u32);
-                    mem.writeIntLittle(u32, vm.memory[address..][0..4], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..4], 0, 32, value, .little);
                 },
                 .store_32 => {
                     const value = vm.pop(u32);
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    mem.writeIntLittle(u32, vm.memory[address..][0..4], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..4], 0, 32, value, .little);
                 },
                 .store_0_64 => {
                     const value = vm.pop(u64);
                     const address = vm.pop(u32);
-                    mem.writeIntLittle(u64, vm.memory[address..][0..8], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..8], 0, 64, value, .little);
                 },
                 .store_64 => {
                     const value = vm.pop(u64);
                     const address = vm.pop(u32) + operands[pc.operand];
                     pc.operand += 1;
-                    mem.writeIntLittle(u64, vm.memory[address..][0..8], value);
+                    mem.writeVarPackedInt(vm.memory[address..][0..8], 0, 64, value, .little);
                 },
                 .mem_size => {
-                    const page_count = @intCast(u32, vm.memory_len / wasm.page_size);
+                    const page_count = @as(u32, vm.memory_len / wasm.page_size);
                     vm.push(u32, page_count);
                 },
                 .mem_grow => {
                     const page_count = vm.pop(u32);
-                    const old_page_count = @intCast(u32, vm.memory_len / wasm.page_size);
+                    const old_page_count = @as(u32, vm.memory_len / wasm.page_size);
                     const new_len = vm.memory_len + page_count * wasm.page_size;
                     if (new_len > vm.memory.len) {
                         vm.push(i32, -1);
@@ -2357,12 +2388,12 @@ const VirtualMachine = struct {
                 .const_32 => {
                     const x = operands[pc.operand];
                     pc.operand += 1;
-                    vm.push(i32, @bitCast(i32, x));
+                    vm.push(i32, @intCast(x));
                 },
                 .const_64 => {
                     const x = operands[pc.operand] | @as(u64, operands[pc.operand + 1]) << 32;
                     pc.operand += 2;
-                    vm.push(i64, @bitCast(i64, x));
+                    vm.push(i64, @intCast(x));
                 },
                 .const_umax_32 => {
                     vm.push(i32, -1);
@@ -2372,171 +2403,171 @@ const VirtualMachine = struct {
                 },
                 .eqz_32 => {
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs == 0));
+                    vm.push(u32, @intFromBool(lhs == 0));
                 },
                 .eq_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs == rhs));
+                    vm.push(u32, @intFromBool(lhs == rhs));
                 },
                 .ne_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs != rhs));
+                    vm.push(u32, @intFromBool(lhs != rhs));
                 },
                 .slt_32 => {
                     const rhs = vm.pop(i32);
                     const lhs = vm.pop(i32);
-                    vm.push(u32, @boolToInt(lhs < rhs));
+                    vm.push(u32, @intFromBool(lhs < rhs));
                 },
                 .ult_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs < rhs));
+                    vm.push(u32, @intFromBool(lhs < rhs));
                 },
                 .sgt_32 => {
                     const rhs = vm.pop(i32);
                     const lhs = vm.pop(i32);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .ugt_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .sle_32 => {
                     const rhs = vm.pop(i32);
                     const lhs = vm.pop(i32);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .ule_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .sge_32 => {
                     const rhs = vm.pop(i32);
                     const lhs = vm.pop(i32);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .uge_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .eqz_64 => {
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs == 0));
+                    vm.push(u32, @intFromBool(lhs == 0));
                 },
                 .eq_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs == rhs));
+                    vm.push(u32, @intFromBool(lhs == rhs));
                 },
                 .ne_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs != rhs));
+                    vm.push(u32, @intFromBool(lhs != rhs));
                 },
                 .slt_64 => {
                     const rhs = vm.pop(i64);
                     const lhs = vm.pop(i64);
-                    vm.push(u32, @boolToInt(lhs < rhs));
+                    vm.push(u32, @intFromBool(lhs < rhs));
                 },
                 .ult_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs < rhs));
+                    vm.push(u32, @intFromBool(lhs < rhs));
                 },
                 .sgt_64 => {
                     const rhs = vm.pop(i64);
                     const lhs = vm.pop(i64);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .ugt_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .sle_64 => {
                     const rhs = vm.pop(i64);
                     const lhs = vm.pop(i64);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .ule_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .sge_64 => {
                     const rhs = vm.pop(i64);
                     const lhs = vm.pop(i64);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .uge_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .feq_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs == rhs));
+                    vm.push(u32, @intFromBool(lhs == rhs));
                 },
                 .fne_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs != rhs));
+                    vm.push(u32, @intFromBool(lhs != rhs));
                 },
                 .flt_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs < rhs));
+                    vm.push(u32, @intFromBool(lhs < rhs));
                 },
                 .fgt_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .fle_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .fge_32 => {
                     const rhs = vm.pop(f32);
                     const lhs = vm.pop(f32);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .feq_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs == rhs));
+                    vm.push(u32, @intFromBool(lhs == rhs));
                 },
                 .fne_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs != rhs));
+                    vm.push(u32, @intFromBool(lhs != rhs));
                 },
                 .flt_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .fgt_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs > rhs));
+                    vm.push(u32, @intFromBool(lhs > rhs));
                 },
                 .fle_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs <= rhs));
+                    vm.push(u32, @intFromBool(lhs <= rhs));
                 },
                 .fge_64 => {
                     const rhs = vm.pop(f64);
                     const lhs = vm.pop(f64);
-                    vm.push(u32, @boolToInt(lhs >= rhs));
+                    vm.push(u32, @intFromBool(lhs >= rhs));
                 },
                 .clz_32 => {
                     vm.push(u32, @clz(vm.pop(u32)));
@@ -2600,17 +2631,17 @@ const VirtualMachine = struct {
                 .shl_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, lhs << @truncate(u5, rhs));
+                    vm.push(u32, lhs << @truncate(rhs));
                 },
                 .ashr_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(i32);
-                    vm.push(i32, lhs >> @truncate(u5, rhs));
+                    vm.push(i32, lhs >> @truncate(rhs));
                 },
                 .lshr_32 => {
                     const rhs = vm.pop(u32);
                     const lhs = vm.pop(u32);
-                    vm.push(u32, lhs >> @truncate(u5, rhs));
+                    vm.push(u32, lhs >> @truncate(rhs));
                 },
                 .rol_32 => {
                     const rhs = vm.pop(u32);
@@ -2684,17 +2715,17 @@ const VirtualMachine = struct {
                 .shl_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u64, lhs << @truncate(u6, rhs));
+                    vm.push(u64, lhs << @truncate(rhs));
                 },
                 .ashr_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(i64);
-                    vm.push(i64, lhs >> @truncate(u6, rhs));
+                    vm.push(i64, lhs >> @truncate(rhs));
                 },
                 .lshr_64 => {
                     const rhs = vm.pop(u64);
                     const lhs = vm.pop(u64);
-                    vm.push(u64, lhs >> @truncate(u6, rhs));
+                    vm.push(u64, lhs >> @truncate(rhs));
                 },
                 .rol_64 => {
                     const rhs = vm.pop(u64);
@@ -2707,7 +2738,7 @@ const VirtualMachine = struct {
                     vm.push(u64, math.rotr(u64, lhs, rhs % 64));
                 },
                 .fabs_32 => {
-                    vm.push(f32, @fabs(vm.pop(f32)));
+                    vm.push(f32, @abs(vm.pop(f32)));
                 },
                 .fneg_32 => {
                     vm.push(f32, -vm.pop(f32));
@@ -2763,7 +2794,7 @@ const VirtualMachine = struct {
                     vm.push(f32, math.copysign(lhs, rhs));
                 },
                 .fabs_64 => {
-                    vm.push(f64, @fabs(vm.pop(f64)));
+                    vm.push(f64, @abs(vm.pop(f64)));
                 },
                 .fneg_64 => {
                     vm.push(f64, -vm.pop(f64));
@@ -2819,76 +2850,76 @@ const VirtualMachine = struct {
                     vm.push(f64, math.copysign(lhs, rhs));
                 },
                 .ftos_32_32 => {
-                    vm.push(i32, @floatToInt(i32, vm.pop(f32)));
+                    vm.push(i32, @intFromFloat(vm.pop(f32)));
                 },
                 .ftou_32_32 => {
-                    vm.push(u32, @floatToInt(u32, vm.pop(f32)));
+                    vm.push(u32, @intFromFloat(vm.pop(f32)));
                 },
                 .ftos_32_64 => {
-                    vm.push(i32, @floatToInt(i32, vm.pop(f64)));
+                    vm.push(i32, @intFromFloat(vm.pop(f64)));
                 },
                 .ftou_32_64 => {
-                    vm.push(u32, @floatToInt(u32, vm.pop(f64)));
+                    vm.push(u32, @intFromFloat(vm.pop(f64)));
                 },
                 .sext_64_32 => {
-                    vm.push(i32, @bitCast(i32, vm.stack[vm.stack_top - 1]) >> 31);
+                    vm.push(i32, @as(i32, @bitCast(vm.stack[vm.stack_top - 1])) >> 31);
                 },
                 .ftos_64_32 => {
-                    vm.push(i64, @floatToInt(i64, vm.pop(f32)));
+                    vm.push(i64, @intFromFloat(vm.pop(f32)));
                 },
                 .ftou_64_32 => {
-                    vm.push(u64, @floatToInt(u64, vm.pop(f32)));
+                    vm.push(u64, @intFromFloat(vm.pop(f32)));
                 },
                 .ftos_64_64 => {
-                    vm.push(i64, @floatToInt(i64, vm.pop(f64)));
+                    vm.push(i64, @intFromFloat(vm.pop(f64)));
                 },
                 .ftou_64_64 => {
-                    vm.push(u64, @floatToInt(u64, vm.pop(f64)));
+                    vm.push(u64, @intFromFloat(vm.pop(f64)));
                 },
                 .stof_32_32 => {
-                    vm.push(f32, @intToFloat(f32, vm.pop(i32)));
+                    vm.push(f32, @floatFromInt(vm.pop(i32)));
                 },
                 .utof_32_32 => {
-                    vm.push(f32, @intToFloat(f32, vm.pop(u32)));
+                    vm.push(f32, @floatFromInt(vm.pop(u32)));
                 },
                 .stof_32_64 => {
-                    vm.push(f32, @intToFloat(f32, vm.pop(i64)));
+                    vm.push(f32, @floatFromInt(vm.pop(i64)));
                 },
                 .utof_32_64 => {
-                    vm.push(f32, @intToFloat(f32, vm.pop(u64)));
+                    vm.push(f32, @floatFromInt(vm.pop(u64)));
                 },
                 .ftof_32_64 => {
-                    vm.push(f32, @floatCast(f32, vm.pop(f64)));
+                    vm.push(f32, @floatCast(vm.pop(f64)));
                 },
                 .stof_64_32 => {
-                    vm.push(f64, @intToFloat(f64, vm.pop(i32)));
+                    vm.push(f64, @floatFromInt(vm.pop(i32)));
                 },
                 .utof_64_32 => {
-                    vm.push(f64, @intToFloat(f64, vm.pop(u32)));
+                    vm.push(f64, @floatFromInt(vm.pop(u32)));
                 },
                 .stof_64_64 => {
-                    vm.push(f64, @intToFloat(f64, vm.pop(i64)));
+                    vm.push(f64, @floatFromInt(vm.pop(i64)));
                 },
                 .utof_64_64 => {
-                    vm.push(f64, @intToFloat(f64, vm.pop(u64)));
+                    vm.push(f64, @floatFromInt(vm.pop(u64)));
                 },
                 .ftof_64_32 => {
-                    vm.push(f64, @floatCast(f64, vm.pop(f32)));
+                    vm.push(f64, @as(f64, vm.pop(f32)));
                 },
                 .sext8_32 => {
-                    vm.push(i32, @truncate(i8, vm.pop(i32)));
+                    vm.push(i32, @truncate(vm.pop(i32)));
                 },
                 .sext16_32 => {
-                    vm.push(i32, @truncate(i16, vm.pop(i32)));
+                    vm.push(i32, @truncate(vm.pop(i32)));
                 },
                 .sext8_64 => {
-                    vm.push(i64, @truncate(i8, vm.pop(i64)));
+                    vm.push(i64, @truncate(vm.pop(i64)));
                 },
                 .sext16_64 => {
-                    vm.push(i64, @truncate(i16, vm.pop(i64)));
+                    vm.push(i64, @truncate(vm.pop(i64)));
                 },
                 .sext32_64 => {
-                    vm.push(i64, @truncate(i32, vm.pop(i64)));
+                    vm.push(i64, @truncate(vm.pop(i64)));
                 },
                 .memcpy => {
                     const n = vm.pop(u32);
@@ -2897,14 +2928,14 @@ const VirtualMachine = struct {
                     assert(dest + n <= vm.memory_len);
                     assert(src + n <= vm.memory_len);
                     assert(src + n <= dest or dest + n <= src); // overlapping
-                    @memcpy(vm.memory.ptr + dest, vm.memory.ptr + src, n);
+                    @memcpy((vm.memory.ptr + dest)[0..n], vm.memory.ptr + src);
                 },
                 .memset => {
                     const n = vm.pop(u32);
-                    const value = @truncate(u8, vm.pop(u32));
+                    const value: u8 = @truncate(vm.pop(u32));
                     const dest = vm.pop(u32);
                     assert(dest + n <= vm.memory_len);
-                    @memset(vm.memory.ptr + dest, value, n);
+                    @memset((vm.memory.ptr + dest)[0..n], value);
                 },
             }
         }
@@ -2914,12 +2945,12 @@ const VirtualMachine = struct {
 /// fn args_sizes_get(argc: *usize, argv_buf_size: *usize) errno_t;
 fn wasi_args_sizes_get(vm: *VirtualMachine, argc: u32, argv_buf_size: u32) wasi.errno_t {
     trace_log.debug("wasi_args_sizes_get argc={d} argv_buf_size={d}", .{ argc, argv_buf_size });
-    mem.writeIntLittle(u32, vm.memory[argc..][0..4], @intCast(u32, vm.args.len));
+    mem.writeVarPackedInt(vm.memory[argc..][0..4], 0, 32, @as(u32, @intCast(vm.args.len)), .little);
     var buf_size: usize = 0;
     for (vm.args) |arg| {
         buf_size += mem.span(arg).len + 1;
     }
-    mem.writeIntLittle(u32, vm.memory[argv_buf_size..][0..4], @intCast(u32, buf_size));
+    mem.writeVarPackedInt(vm.memory[argv_buf_size..][0..4], 0, 32, @as(u32, @intCast(buf_size)), .little);
     return .SUCCESS;
 }
 
@@ -2927,14 +2958,14 @@ fn wasi_args_sizes_get(vm: *VirtualMachine, argc: u32, argv_buf_size: u32) wasi.
 fn wasi_args_get(vm: *VirtualMachine, argv: u32, argv_buf: u32) wasi.errno_t {
     trace_log.debug("wasi_args_get argv={d} argv_buf={d}", .{ argv, argv_buf });
     var argv_buf_i: usize = 0;
-    for (vm.args) |arg, arg_i| {
+    for (vm.args, 0..) |arg, arg_i| {
         // Write the arg to the buffer.
         const argv_ptr = argv_buf + argv_buf_i;
         const arg_len = mem.span(arg).len + 1;
-        mem.copy(u8, vm.memory[argv_buf + argv_buf_i ..], arg[0..arg_len]);
+        @memcpy(vm.memory[argv_buf + argv_buf_i ..], arg[0..arg_len]);
         argv_buf_i += arg_len;
 
-        mem.writeIntLittle(u32, vm.memory[argv + 4 * arg_i ..][0..4], @intCast(u32, argv_ptr));
+        mem.writeVarPackedInt(vm.memory[argv + 4 * arg_i ..][0..4], 0, 32, @as(u32, @intCast(argv_ptr)), .little);
     }
     return .SUCCESS;
 }
@@ -2953,10 +2984,10 @@ var preopens_len: usize = 0;
 const Preopen = struct {
     wasi_fd: wasi.fd_t,
     name: []const u8,
-    host_fd: os.fd_t,
+    host_fd: std.posix.fd_t,
 };
 
-fn addPreopen(wasi_fd: wasi.fd_t, name: []const u8, host_fd: os.fd_t) void {
+fn addPreopen(wasi_fd: wasi.fd_t, name: []const u8, host_fd: std.posix.fd_t) void {
     preopens_buffer[preopens_len] = .{
         .wasi_fd = wasi_fd,
         .name = name,
@@ -2974,7 +3005,7 @@ fn findPreopen(wasi_fd: wasi.fd_t) ?Preopen {
     return null;
 }
 
-fn toHostFd(wasi_fd: wasi.fd_t) os.fd_t {
+fn toHostFd(wasi_fd: wasi.fd_t) std.posix.fd_t {
     const preopen = findPreopen(wasi_fd) orelse return wasi_fd;
     return preopen.host_fd;
 }
@@ -2987,8 +3018,8 @@ fn toHostFd(wasi_fd: wasi.fd_t) os.fd_t {
 fn wasi_fd_prestat_get(vm: *VirtualMachine, fd: wasi.fd_t, buf: u32) wasi.errno_t {
     trace_log.debug("wasi_fd_prestat_get fd={d} buf={d}", .{ fd, buf });
     const preopen = findPreopen(fd) orelse return .BADF;
-    mem.writeIntLittle(u32, vm.memory[buf + 0 ..][0..4], 0);
-    mem.writeIntLittle(u32, vm.memory[buf + 4 ..][0..4], @intCast(u32, preopen.name.len));
+    mem.writePackedInt(u32, vm.memory[buf + 0 ..][0..4], 0, 0, .little);
+    mem.writePackedInt(u32, vm.memory[buf + 4 ..][0..4], 0, @as(u32, @intCast(preopen.name.len)), .little);
     return .SUCCESS;
 }
 
@@ -2997,7 +3028,7 @@ fn wasi_fd_prestat_dir_name(vm: *VirtualMachine, fd: wasi.fd_t, path: u32, path_
     trace_log.debug("wasi_fd_prestat_dir_name fd={d} path={d} path_len={d}", .{ fd, path, path_len });
     const preopen = findPreopen(fd) orelse return .BADF;
     assert(path_len == preopen.name.len);
-    mem.copy(u8, vm.memory[path..], preopen.name);
+    @memcpy(vm.memory[path..], preopen.name);
     return .SUCCESS;
 }
 
@@ -3006,7 +3037,7 @@ fn wasi_fd_close(vm: *VirtualMachine, fd: wasi.fd_t) wasi.errno_t {
     trace_log.debug("wasi_fd_close fd={d}", .{fd});
     _ = vm;
     const host_fd = toHostFd(fd);
-    os.close(host_fd);
+    std.posix.close(host_fd);
     return .SUCCESS;
 }
 
@@ -3024,15 +3055,15 @@ fn wasi_fd_read(
     var i: u32 = 0;
     var total_read: usize = 0;
     while (i < iovs_len) : (i += 1) {
-        const ptr = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 0 ..][0..4]);
-        const len = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 4 ..][0..4]);
+        const ptr = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 0 ..][0..4], .little);
+        const len = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 4 ..][0..4], .little);
         const buf = vm.memory[ptr..][0..len];
-        const read = os.read(host_fd, buf) catch |err| return toWasiError(err);
+        const read = std.posix.read(host_fd, buf) catch |err| return toWasiError(err);
         trace_log.debug("read {d} bytes out of {d}", .{ read, buf.len });
         total_read += read;
         if (read != buf.len) break;
     }
-    mem.writeIntLittle(u32, vm.memory[nread..][0..4], @intCast(u32, total_read));
+    mem.writeVarPackedInt(vm.memory[nread..][0..4], 0, 32, @as(u32, @intCast(total_read)), .little);
     return .SUCCESS;
 }
 
@@ -3049,14 +3080,14 @@ fn wasi_fd_write(vm: *VirtualMachine, fd: wasi.fd_t, iovs: u32, iovs_len: u32, n
     var i: u32 = 0;
     var total_written: usize = 0;
     while (i < iovs_len) : (i += 1) {
-        const ptr = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 0 ..][0..4]);
-        const len = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 4 ..][0..4]);
+        const ptr = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 0 ..][0..4], .little);
+        const len = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 4 ..][0..4], .little);
         const buf = vm.memory[ptr..][0..len];
-        const written = os.write(host_fd, buf) catch |err| return toWasiError(err);
+        const written = std.posix.write(host_fd, buf) catch |err| return toWasiError(err);
         total_written += written;
         if (written != buf.len) break;
     }
-    mem.writeIntLittle(u32, vm.memory[nwritten..][0..4], @intCast(u32, total_written));
+    mem.writeVarPackedInt(vm.memory[nwritten..][0..4], 0, 32, @as(u32, @intCast(total_written)), .little);
     return .SUCCESS;
 }
 
@@ -3075,14 +3106,14 @@ fn wasi_fd_pwrite(
     var i: u32 = 0;
     var written: usize = 0;
     while (i < iovs_len) : (i += 1) {
-        const ptr = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 0 ..][0..4]);
-        const len = mem.readIntLittle(u32, vm.memory[iovs + i * 8 + 4 ..][0..4]);
+        const ptr = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 0 ..][0..4], .little);
+        const len = mem.readVarInt(u32, vm.memory[iovs + i * 8 + 4 ..][0..4], .little);
         const buf = vm.memory[ptr..][0..len];
-        const w = os.pwrite(host_fd, buf, offset + written) catch |err| return toWasiError(err);
+        const w = std.posix.pwrite(host_fd, buf, offset + written) catch |err| return toWasiError(err);
         written += w;
         if (w != buf.len) break;
     }
-    mem.writeIntLittle(u32, vm.memory[written_ptr..][0..4], @intCast(u32, written));
+    mem.writeVarPackedInt(vm.memory[written_ptr..][0..4], 0, 32, @as(u32, @intCast(written)), .little);
     return .SUCCESS;
 }
 
@@ -3111,29 +3142,30 @@ fn wasi_path_open(
 ) wasi.errno_t {
     const sub_path = vm.memory[path..][0..path_len];
     trace_log.debug("wasi_path_open dirfd={d} dirflags={d} path={s} oflags={d} fs_rights_base={d} fs_rights_inheriting={d} fs_flags={d} fd={d}", .{
-        dirfd, dirflags, sub_path, oflags, fs_rights_base, fs_rights_inheriting, fs_flags, fd,
+        dirfd,
+        @as(u32, @bitCast(dirflags)),
+        sub_path,
+        @as(u16, @bitCast(oflags)),
+        @as(u64, @bitCast(fs_rights_base)),
+        @as(u64, @bitCast(fs_rights_inheriting)),
+        @as(u16, @bitCast(fs_flags)),
+        fd,
     });
     const host_fd = toHostFd(dirfd);
-    var flags: u32 = @as(u32, if (oflags & wasi.O.CREAT != 0) os.O.CREAT else 0) |
-        @as(u32, if (oflags & wasi.O.DIRECTORY != 0) os.O.DIRECTORY else 0) |
-        @as(u32, if (oflags & wasi.O.EXCL != 0) os.O.EXCL else 0) |
-        @as(u32, if (oflags & wasi.O.TRUNC != 0) os.O.TRUNC else 0) |
-        @as(u32, if (fs_flags & wasi.FDFLAG.APPEND != 0) os.O.APPEND else 0) |
-        @as(u32, if (fs_flags & wasi.FDFLAG.DSYNC != 0) os.O.DSYNC else 0) |
-        @as(u32, if (fs_flags & wasi.FDFLAG.NONBLOCK != 0) os.O.NONBLOCK else 0) |
-        @as(u32, if (fs_flags & wasi.FDFLAG.SYNC != 0) os.O.SYNC else 0);
-    if ((fs_rights_base & wasi.RIGHT.FD_READ != 0) and
-        (fs_rights_base & wasi.RIGHT.FD_WRITE != 0))
-    {
-        flags |= os.O.RDWR;
-    } else if (fs_rights_base & wasi.RIGHT.FD_WRITE != 0) {
-        flags |= os.O.WRONLY;
-    } else if (fs_rights_base & wasi.RIGHT.FD_READ != 0) {
-        flags |= os.O.RDONLY; // no-op because O_RDONLY is 0
-    }
+    const flags: std.posix.O = .{
+        .CREAT = oflags.CREAT,
+        .DIRECTORY = oflags.DIRECTORY,
+        .TRUNC = oflags.TRUNC,
+        .APPEND = fs_flags.APPEND,
+        .DSYNC = fs_flags.DSYNC,
+        .NONBLOCK = fs_flags.NONBLOCK,
+        .SYNC = fs_flags.SYNC,
+        .ACCMODE = if (fs_rights_base.FD_READ and fs_rights_base.FD_WRITE) .RDWR else if (fs_rights_base.FD_READ) .RDONLY else .WRONLY,
+    };
+
     const mode = 0o644;
-    const res_fd = os.openat(host_fd, sub_path, flags, mode) catch |err| return toWasiError(err);
-    mem.writeIntLittle(i32, vm.memory[fd..][0..4], res_fd);
+    const res_fd = std.posix.openat(host_fd, sub_path, flags, mode) catch |err| return toWasiError(err);
+    mem.writeVarPackedInt(vm.memory[fd..][0..4], 0, 32, res_fd, .little);
     return .SUCCESS;
 }
 
@@ -3147,7 +3179,7 @@ fn wasi_path_filestat_get(
 ) wasi.errno_t {
     const sub_path = vm.memory[path..][0..path_len];
     trace_log.debug("wasi_path_filestat_get fd={d} flags={d} path={s} buf={d}", .{
-        fd, flags, sub_path, buf,
+        fd, @as(u32, @bitCast(flags)), sub_path, buf,
     });
     const host_fd = toHostFd(fd);
     const dir: fs.Dir = .{ .fd = host_fd };
@@ -3181,7 +3213,7 @@ fn wasi_path_rename(
     });
     const old_host_fd = toHostFd(old_fd);
     const new_host_fd = toHostFd(new_fd);
-    os.renameat(old_host_fd, old_path, new_host_fd, new_path) catch |err| return toWasiError(err);
+    std.posix.renameat(old_host_fd, old_path, new_host_fd, new_path) catch |err| return toWasiError(err);
     return .SUCCESS;
 }
 
@@ -3198,7 +3230,7 @@ fn wasi_fd_filestat_set_size(vm: *VirtualMachine, fd: wasi.fd_t, size: wasi.file
     _ = vm;
     trace_log.debug("wasi_fd_filestat_set_size fd={d} size={d}", .{ fd, size });
     const host_fd = toHostFd(fd);
-    os.ftruncate(host_fd, size) catch |err| return toWasiError(err);
+    std.posix.ftruncate(host_fd, size) catch |err| return toWasiError(err);
     return .SUCCESS;
 }
 
@@ -3214,10 +3246,11 @@ fn wasi_fd_fdstat_get(vm: *VirtualMachine, fd: wasi.fd_t, buf: u32) wasi.errno_t
     const host_fd = toHostFd(fd);
     const file = fs.File{ .handle = host_fd };
     const stat = file.stat() catch |err| return toWasiError(err);
-    mem.writeIntLittle(u16, vm.memory[buf + 0x00 ..][0..2], @enumToInt(toWasiFileType(stat.kind)));
-    mem.writeIntLittle(u16, vm.memory[buf + 0x02 ..][0..2], 0); // flags
-    mem.writeIntLittle(u64, vm.memory[buf + 0x08 ..][0..8], math.maxInt(u64)); // rights_base
-    mem.writeIntLittle(u64, vm.memory[buf + 0x10 ..][0..8], math.maxInt(u64)); // rights_inheriting
+    const value: u16 = @intCast(@intFromEnum(toWasiFileType(stat.kind)));
+    mem.writePackedInt(u16, vm.memory[buf + 0x00 ..][0..2], 0, value, .little);
+    mem.writePackedInt(u16, vm.memory[buf + 0x02 ..][0..2], 0, 0, .little); // flags
+    mem.writePackedInt(u64, vm.memory[buf + 0x08 ..][0..8], 0, math.maxInt(u64), .little); // rights_base
+    mem.writePackedInt(u64, vm.memory[buf + 0x10 ..][0..8], 0, math.maxInt(u64), .little); // rights_inheriting
     return .SUCCESS;
 }
 
@@ -3227,7 +3260,7 @@ fn wasi_clock_time_get(vm: *VirtualMachine, clock_id: wasi.clockid_t, precision:
     _ = precision;
     _ = clock_id;
     const wasi_ts = toWasiTimestamp(std.time.nanoTimestamp());
-    mem.writeIntLittle(u64, vm.memory[timestamp..][0..8], wasi_ts);
+    mem.writeVarPackedInt(vm.memory[timestamp..][0..8], 0, 64, wasi_ts, .little);
     return .SUCCESS;
 }
 
@@ -3244,7 +3277,7 @@ fn wasi_debug_slice(vm: *VirtualMachine, ptr: u32, len: u32) void {
 }
 
 fn toWasiTimestamp(ns: i128) u64 {
-    return @intCast(u64, ns);
+    return @truncate(@as(u128, @intCast(ns)));
 }
 
 fn toWasiError(err: anyerror) wasi.errno_t {
@@ -3266,18 +3299,18 @@ fn toWasiError(err: anyerror) wasi.errno_t {
 
 fn toWasiFileType(kind: fs.File.Kind) wasi.filetype_t {
     return switch (kind) {
-        .BlockDevice => .BLOCK_DEVICE,
-        .CharacterDevice => .CHARACTER_DEVICE,
-        .Directory => .DIRECTORY,
-        .SymLink => .SYMBOLIC_LINK,
-        .File => .REGULAR_FILE,
-        .Unknown => .UNKNOWN,
+        .block_device => .BLOCK_DEVICE,
+        .character_device => .CHARACTER_DEVICE,
+        .directory => .DIRECTORY,
+        .sym_link => .SYMBOLIC_LINK,
+        .file => .REGULAR_FILE,
+        .unknown => .UNKNOWN,
 
-        .NamedPipe,
-        .UnixDomainSocket,
-        .Whiteout,
-        .Door,
-        .EventPort,
+        .named_pipe,
+        .unix_domain_socket,
+        .whiteout,
+        .door,
+        .event_port,
         => .UNKNOWN,
     };
 }
@@ -3293,13 +3326,13 @@ fn toWasiFileType(kind: fs.File.Kind) wasi.filetype_t {
 ///     ctim: timestamp_t, u64
 /// };
 fn finishWasiStat(vm: *VirtualMachine, buf: u32, stat: fs.File.Stat) wasi.errno_t {
-    mem.writeIntLittle(u64, vm.memory[buf + 0x00 ..][0..8], 0); // device
-    mem.writeIntLittle(u64, vm.memory[buf + 0x08 ..][0..8], stat.inode);
-    mem.writeIntLittle(u64, vm.memory[buf + 0x10 ..][0..8], @enumToInt(toWasiFileType(stat.kind)));
-    mem.writeIntLittle(u64, vm.memory[buf + 0x18 ..][0..8], 1); // nlink
-    mem.writeIntLittle(u64, vm.memory[buf + 0x20 ..][0..8], stat.size);
-    mem.writeIntLittle(u64, vm.memory[buf + 0x28 ..][0..8], toWasiTimestamp(stat.atime));
-    mem.writeIntLittle(u64, vm.memory[buf + 0x30 ..][0..8], toWasiTimestamp(stat.mtime));
-    mem.writeIntLittle(u64, vm.memory[buf + 0x38 ..][0..8], toWasiTimestamp(stat.ctime));
+    mem.writePackedInt(u64, vm.memory[buf + 0x00 ..][0..8], 0, 0, .little); // device
+    mem.writePackedInt(u64, vm.memory[buf + 0x08 ..][0..8], 0, stat.inode, .little);
+    mem.writePackedInt(u64, vm.memory[buf + 0x10 ..][0..8], 0, @intFromEnum(toWasiFileType(stat.kind)), .little);
+    mem.writePackedInt(u64, vm.memory[buf + 0x18 ..][0..8], 0, 1, .little); // nlink
+    mem.writePackedInt(u64, vm.memory[buf + 0x20 ..][0..8], 0, stat.size, .little);
+    mem.writePackedInt(u64, vm.memory[buf + 0x28 ..][0..8], 0, toWasiTimestamp(stat.atime), .little);
+    mem.writePackedInt(u64, vm.memory[buf + 0x30 ..][0..8], 0, toWasiTimestamp(stat.mtime), .little);
+    mem.writePackedInt(u64, vm.memory[buf + 0x38 ..][0..8], 0, toWasiTimestamp(stat.ctime), .little);
     return .SUCCESS;
 }

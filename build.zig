@@ -1,26 +1,18 @@
-const std = @import("std");
+const Build = @import("std").Build;
 
-pub fn build(b: *std.build.Builder) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
+pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-    // Standard release options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
-    const mode = b.standardReleaseOptions();
+    const executable = b.addExecutable(.{
+        .name = "zig-wasi",
+        .root_source_file = .{ .path = "src/main.zig" },
+        .link_libc = true,
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const exe = b.addExecutable("zig-wasi", "src/main.zig");
-    exe.linkLibC();
-    exe.setTarget(target);
-    exe.setBuildMode(mode);
-    exe.install();
+    // b.default_step.dependOn(&executable.step);
 
-    const c_exe = b.addExecutable("c-wasi", null);
-    c_exe.addCSourceFiles(&.{"src/main.c"}, &.{ "-std=c99", "-Wall", "-Werror" });
-    c_exe.linkLibC();
-    c_exe.setTarget(target);
-    c_exe.setBuildMode(mode);
-    c_exe.install();
+    b.installArtifact(executable);
 }
