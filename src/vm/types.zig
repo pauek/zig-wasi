@@ -193,7 +193,10 @@ pub const Opcode = enum {
     pub const last = Opcode.memset;
 };
 
-pub const ProgramCounter = struct { opcode: u32, operand: u32 };
+pub const ProgramCounter = struct {
+    opcode: u32,
+    operand: u32,
+};
 
 pub const Mutability = enum { @"const", @"var" };
 
