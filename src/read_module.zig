@@ -1,5 +1,9 @@
 const std = @import("std");
-const cReader = @import("reader.zig").cReader;
+
+const reader = @import("./reader.zig");
+const makeModuleReader = reader.makeModuleReader;
+const ModuleReader = reader.ModuleReader;
+
 const mem = std.mem;
 const wasm = std.wasm;
 const assert = std.debug.assert;
@@ -16,13 +20,21 @@ const SEEK = enum(c_int) { SET, CUR, END };
 
 pub extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: SEEK) c_int;
 
+fn goto_section(module_reader: *ModuleReader, section: wasm.Section) !void {
+    const section_type: wasm.Section = @enumFromInt(try module_reader.readByte());
+    while (section_type != section)
+        assert(fseek(
+            module_reader.context,
+            @as(c_long, try leb.readULEB128(u32, module_reader)),
+            .CUR,
+        ) == 0);
+    _ = try leb.readULEB128(u32, module_reader);
+}
+
 pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file: [*:0]const u8) !u32 {
     var start_fn_idx: u32 = undefined;
-    var section_type: wasm.Section = undefined;
 
-    const module_file = std.c.fopen(wasm_file, "rb") orelse return error.FileNotFound;
-    defer _ = std.c.fclose(module_file);
-    const module_reader = cReader(module_file);
+    var module_reader = try makeModuleReader(wasm_file);
 
     var magic: [4]u8 = undefined;
     try module_reader.readNoEof(&magic);
@@ -31,10 +43,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
     const version = try module_reader.readVarInt(u32, std.builtin.Endian.little, 1);
     if (version != 1) return error.BadWasmVersion;
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .type)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
+    try goto_section(&module_reader, .type);
 
     var max_param_count: u64 = 0;
     vm.types = try allocator.alloc(VM.TypeInfo, try leb.readULEB128(u32, module_reader));
@@ -69,11 +78,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .import)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .import);
     {
         vm.imports = try allocator.alloc(VM.Import, try leb.readULEB128(u32, module_reader));
 
@@ -103,11 +108,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .function)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .function);
     vm.functions = try allocator.alloc(VM.Function, try leb.readULEB128(u32, module_reader));
     for (vm.functions, 0..) |*function, func_idx| {
         const len: u32 = @truncate(vm.imports.len);
@@ -116,11 +117,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         function.type_idx = try leb.readULEB128(u32, module_reader);
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .table)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .table);
     {
         const table_count = try leb.readULEB128(u32, module_reader);
         if (table_count == 1) {
@@ -135,11 +132,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         } else assert(table_count == 0);
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .memory)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .memory);
     {
         assert(try leb.readULEB128(u32, module_reader) == 1);
         const limits_kind = try module_reader.readByte();
@@ -151,11 +144,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .global)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .global);
     vm.globals = try allocator.alloc(u32, try leb.readULEB128(u32, module_reader));
     for (vm.globals) |*global| {
         assert(try leb.readILEB128(i33, module_reader) == -1);
@@ -167,11 +156,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         assert(opcode == .end);
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .@"export")
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .@"export");
     {
         var found_start_fn = false;
         const start_name = "_start";
@@ -185,7 +170,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
                 try module_reader.readNoEof(&str_buf);
                 is_start_fn = mem.eql(u8, &str_buf, start_name);
                 found_start_fn = found_start_fn or is_start_fn;
-            } else assert(fseek(module_file, @as(c_long, name_len), .CUR) == 0);
+            } else assert(fseek(module_reader.context, @as(c_long, name_len), .CUR) == 0);
 
             const kind: wasm.ExternalKind = @enumFromInt(try module_reader.readByte());
             const idx = try leb.readULEB128(u32, module_reader);
@@ -199,11 +184,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         assert(found_start_fn);
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .element)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .element);
     {
         var segment_count = try leb.readULEB128(u32, module_reader);
         while (segment_count > 0) : (segment_count -= 1) {
@@ -239,11 +220,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .code)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .code);
     var max_frame_size: u64 = 0;
     {
         vm.opcodes = try allocator.alloc(u8, 5000000);
@@ -308,11 +285,7 @@ pub fn read_module(allocator: std.mem.Allocator, vm: *VirtualMachine, wasm_file:
         }
     }
 
-    section_type = @enumFromInt(try module_reader.readByte());
-    while (section_type != .data)
-        assert(fseek(module_file, @as(c_long, try leb.readULEB128(u32, module_reader)), .CUR) == 0);
-    _ = try leb.readULEB128(u32, module_reader);
-
+    try goto_section(&module_reader, .data);
     {
         var segment_count = try leb.readULEB128(u32, module_reader);
         while (segment_count > 0) : (segment_count -= 1) {

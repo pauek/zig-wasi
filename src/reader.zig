@@ -2,13 +2,17 @@
 
 const std = @import("std");
 
-pub const CReader = std.io.Reader(*std.c.FILE, std.fs.File.ReadError, cReaderRead);
+pub const ModuleReader = std.io.Reader(*std.c.FILE, std.fs.File.ReadError, c_reader_read);
 
-pub fn cReader(c_file: *std.c.FILE) CReader {
-    return .{ .context = c_file };
+pub fn makeModuleReader(wasm_file: [*:0]const u8) !ModuleReader {
+    const module_file = std.c.fopen(wasm_file, "rb") orelse return error.FileNotFound;
+    // defer _ = std.c.fclose(module_file);
+    return .{ .context = module_file };
 }
 
-fn cReaderRead(c_file: *std.c.FILE, bytes: []u8) std.fs.File.ReadError!usize {
+
+
+fn c_reader_read(c_file: *std.c.FILE, bytes: []u8) std.fs.File.ReadError!usize {
     const amt_read = std.c.fread(bytes.ptr, 1, bytes.len, c_file);
     if (amt_read >= 0) return amt_read;
     const errno: std.os.E = @enumFromInt(std.c._errno().*);
