@@ -41,8 +41,10 @@ fn main_function(main_args: []const [*:0]const u8) !void {
 
     var machine = try vm.makeVirtualMachine(arena);
 
-    var rd = try reader.makeModuleReader(args.wasm_file);
-    const start_fn_idx = try rd.read(arena, &machine);
+    var module_reader = try reader.makeModuleReader(arena, args.wasm_file);
+    defer module_reader.dispose();
+
+    const start_fn_idx = try module_reader.read(&machine);
 
     machine.call(&machine.functions[start_fn_idx - @as(u32, @truncate(machine.imports.len))]);
     machine.run();

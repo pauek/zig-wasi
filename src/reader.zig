@@ -39,51 +39,73 @@ fn c_reader_read(c_file: *std.c.FILE, bytes: []u8) std.fs.File.ReadError!usize {
 const CReader = std.io.Reader(*std.c.FILE, std.fs.File.ReadError, c_reader_read);
 
 pub const ModuleReader = struct {
+    allocator: std.mem.Allocator,
     c_reader: CReader,
+    start_fn_idx: u32 = undefined,
 
     fn advance_to_section(self: *ModuleReader, section: wasm.Section) !void {
-        const section_type: wasm.Section = @enumFromInt(try self.c_reader.readByte());
+        const section_type: wasm.Section = @enumFromInt(try self.readByte());
         while (section_type != section)
             assert(fseek(
                 self.c_reader.context,
-                @as(c_long, try leb.readULEB128(u32, self.c_reader)),
+                @as(c_long, try self.readULEB128(u32)),
                 .CUR,
             ) == 0);
         _ = try leb.readULEB128(u32, self.c_reader);
     }
 
-    pub inline fn readNoEof(self: *ModuleReader, buf: []u8) !void {
+    inline fn readNoEof(self: *ModuleReader, buf: []u8) !void {
         try self.c_reader.readNoEof(buf);
     }
 
-    pub inline fn readVarInt(self: *ModuleReader, comptime ReturnType: type, endian: std.builtin.Endian, size: usize) !ReturnType {
-        return self.c_reader.readVarInt(ReturnType, endian, size);
+    inline fn readVarInt(self: *ModuleReader, comptime T: type, endian: std.builtin.Endian, size: usize) !T {
+        return self.c_reader.readVarInt(T, endian, size);
     }
 
-    pub fn read(self: *ModuleReader, allocator: std.mem.Allocator, vm: *VirtualMachine) !u32 {
-        var start_fn_idx: u32 = undefined;
+    inline fn readULEB128(self: *ModuleReader, comptime T: type) !T {
+        return try leb.readULEB128(T, self.c_reader);
+    }
 
+    inline fn readILEB128(self: *ModuleReader, comptime T: type) !T {
+        return try leb.readILEB128(T, self.c_reader);
+    }
+
+    inline fn readLittleEndian(self: *ModuleReader, comptime T: type) !T {
+        return try self.readVarInt(T, std.builtin.Endian.little, @sizeOf(T));
+    }
+
+    inline fn readByte(self: *ModuleReader) !u8 {
+        return try self.c_reader.readByte();
+    }
+
+    pub fn readPreamble(self: *ModuleReader) !void {
         var magic: [4]u8 = undefined;
         try self.readNoEof(&magic);
-        if (!mem.eql(u8, &magic, "\x00asm")) return error.NotWasm;
+        if (!mem.eql(u8, &magic, "\x00asm")) {
+            return error.NotWasm;
+        }
 
-        const version = try self.readVarInt(u32, std.builtin.Endian.little, 1);
-        if (version != 1) return error.BadWasmVersion;
+        const version = try self.readLittleEndian(u32);
+        if (version != 1) {
+            return error.BadWasmVersion;
+        }
+    }
 
+    pub fn readTypeSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.type);
 
         var max_param_count: u64 = 0;
-        vm.types = try allocator.alloc(VM.TypeInfo, try leb.readULEB128(u32, self.c_reader));
+        vm.types = try self.allocator.alloc(VM.TypeInfo, try self.readULEB128(u32));
         for (vm.types) |*@"type"| {
-            assert(try leb.readILEB128(i33, self.c_reader) == -0x20);
+            assert(try self.readILEB128(i33) == -0x20);
 
-            @"type".param_count = try leb.readULEB128(u32, self.c_reader);
+            @"type".param_count = try self.readULEB128(u32);
             assert(@"type".param_count <= 32);
             @"type".param_types = VM.TypeInfo.ParamTypes.initEmpty();
             max_param_count = @max(@"type".param_count, max_param_count);
             var param_index: u32 = 0;
             while (param_index < @"type".param_count) : (param_index += 1) {
-                const param_type = try leb.readILEB128(i33, self.c_reader);
+                const param_type = try self.readILEB128(i33);
                 @"type".param_types.setValue(param_index, switch (param_type) {
                     -1, -3 => false,
                     -2, -4 => true,
@@ -91,12 +113,12 @@ pub const ModuleReader = struct {
                 });
             }
 
-            @"type".result_count = try leb.readULEB128(u32, self.c_reader);
+            @"type".result_count = try self.readULEB128(u32);
             assert(@"type".result_count <= 1);
             @"type".result_types = VM.TypeInfo.ResultTypes.initEmpty();
             var result_index: u32 = 0;
             while (result_index < @"type".result_count) : (result_index += 1) {
-                const result_type = try leb.readILEB128(i33, self.c_reader);
+                const result_type = try self.readILEB128(i33);
                 @"type".result_types.setValue(result_index, switch (result_type) {
                     -1, -3 => false,
                     -2, -4 => true,
@@ -104,10 +126,12 @@ pub const ModuleReader = struct {
                 });
             }
         }
+    }
 
+    inline fn readImportSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.import);
         {
-            vm.imports = try allocator.alloc(VM.Import, try leb.readULEB128(u32, self.c_reader));
+            vm.imports = try self.allocator.alloc(VM.Import, try self.readULEB128(u32));
 
             comptime var max_str_len: usize = 0;
             inline for (.{ VM.Import.Mod, VM.Import.Name }) |Enum| {
@@ -118,80 +142,92 @@ pub const ModuleReader = struct {
             var str_buf: [max_str_len]u8 = undefined;
 
             for (vm.imports) |*import| {
-                const mod = str_buf[0..try leb.readULEB128(u32, self.c_reader)];
+                const mod = str_buf[0..try self.readULEB128(u32)];
                 try self.readNoEof(mod);
                 import.mod = std.meta.stringToEnum(VM.Import.Mod, mod).?;
 
-                const name = str_buf[0..try leb.readULEB128(u32, self.c_reader)];
+                const name = str_buf[0..try self.readULEB128(u32)];
                 try self.readNoEof(name);
                 import.name = std.meta.stringToEnum(VM.Import.Name, name).?;
 
-                const kind: wasm.ExternalKind = @enumFromInt(try self.c_reader.readByte());
-                const idx = try leb.readULEB128(u32, self.c_reader);
+                const kind: wasm.ExternalKind = @enumFromInt(try self.readByte());
+                const idx = try self.readULEB128(u32);
                 switch (kind) {
                     .function => import.type_idx = idx,
                     .table, .memory, .global => unreachable,
                 }
             }
         }
+    }
 
+    fn readFunctionSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.function);
-        vm.functions = try allocator.alloc(VM.Function, try leb.readULEB128(u32, self.c_reader));
+        const num_functions = try self.readULEB128(u32);
+        vm.functions = try self.allocator.alloc(VM.Function, num_functions);
         for (vm.functions, 0..) |*function, func_idx| {
             const len: u32 = @truncate(vm.imports.len);
             const idx: u32 = @truncate(func_idx);
             function.id = len + idx;
-            function.type_idx = try leb.readULEB128(u32, self.c_reader);
+            function.type_idx = try self.readULEB128(u32);
         }
+    }
 
+    fn readTableSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.table);
         {
-            const table_count = try leb.readULEB128(u32, self.c_reader);
+            const table_count = try self.readULEB128(u32);
             if (table_count == 1) {
-                assert(try leb.readILEB128(i33, self.c_reader) == -0x10);
-                const limits_kind = try self.c_reader.readByte();
-                vm.table = try allocator.alloc(u32, try leb.readULEB128(u32, self.c_reader));
+                assert(try self.readILEB128(i33) == -0x10);
+                const limits_kind = try self.readByte();
+                vm.table = try self.allocator.alloc(u32, try self.readULEB128(u32));
                 switch (limits_kind) {
                     0x00 => {},
-                    0x01 => _ = try leb.readULEB128(u32, self.c_reader),
+                    0x01 => _ = try self.readULEB128(u32),
                     else => unreachable,
                 }
             } else assert(table_count == 0);
         }
+    }
 
+    fn readMemorySection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.memory);
         {
-            assert(try leb.readULEB128(u32, self.c_reader) == 1);
-            const limits_kind = try self.c_reader.readByte();
-            vm.memory_len = try leb.readULEB128(u32, self.c_reader) * wasm.page_size;
+            assert(try self.readULEB128(u32) == 1);
+            const limits_kind = try self.readByte();
+            vm.memory_len = try self.readULEB128(u32) * wasm.page_size;
             switch (limits_kind) {
                 0x00 => {},
-                0x01 => _ = try leb.readULEB128(u32, self.c_reader),
+                0x01 => _ = try self.readULEB128(u32),
                 else => unreachable,
             }
         }
+    }
 
+    fn readGlobalsSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.global);
-        vm.globals = try allocator.alloc(u32, try leb.readULEB128(u32, self.c_reader));
+        const num_globals = try self.readULEB128(u32);
+        vm.globals = try self.allocator.alloc(u32, num_globals);
         for (vm.globals) |*global| {
-            assert(try leb.readILEB128(i33, self.c_reader) == -1);
-            _ = try self.c_reader.readByte();
-            const global_type: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+            assert(try self.readILEB128(i33) == -1);
+            _ = try self.readByte();
+            const global_type: wasm.Opcode = @enumFromInt(try self.readByte());
             assert(global_type == .i32_const);
-            global.* = @intCast(try leb.readILEB128(i32, self.c_reader));
-            const opcode: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+            global.* = @intCast(try self.readILEB128(i32));
+            const opcode: wasm.Opcode = @enumFromInt(try self.readByte());
             assert(opcode == .end);
         }
+    }
 
+    fn readExportsSection(self: *ModuleReader) !void {
         try self.advance_to_section(.@"export");
         {
             var found_start_fn = false;
             const start_name = "_start";
             var str_buf: [start_name.len]u8 = undefined;
 
-            var export_count = try leb.readULEB128(u32, self.c_reader);
+            var export_count = try self.readULEB128(u32);
             while (export_count > 0) : (export_count -= 1) {
-                const name_len = try leb.readULEB128(u32, self.c_reader);
+                const name_len = try self.readULEB128(u32);
                 var is_start_fn = false;
                 if (name_len == start_name.len) {
                     try self.readNoEof(&str_buf);
@@ -199,65 +235,69 @@ pub const ModuleReader = struct {
                     found_start_fn = found_start_fn or is_start_fn;
                 } else assert(fseek(self.c_reader.context, @as(c_long, name_len), .CUR) == 0);
 
-                const kind: wasm.ExternalKind = @enumFromInt(try self.c_reader.readByte());
-                const idx = try leb.readULEB128(u32, self.c_reader);
+                const kind: wasm.ExternalKind = @enumFromInt(try self.readByte());
+                const idx = try self.readULEB128(u32);
                 switch (kind) {
                     .function => if (is_start_fn) {
-                        start_fn_idx = idx;
+                        self.start_fn_idx = idx;
                     },
                     .table, .memory, .global => {},
                 }
             }
             assert(found_start_fn);
         }
+    }
 
+    fn readElementsSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.element);
         {
-            var segment_count = try leb.readULEB128(u32, self.c_reader);
+            var segment_count = try self.readULEB128(u32);
             while (segment_count > 0) : (segment_count -= 1) {
-                const flags: u32 = @intCast(try leb.readULEB128(u32, self.c_reader));
+                const flags: u32 = @intCast(try self.readULEB128(u32));
                 assert(flags & 0b001 == 0b000);
-                if (flags & 0b010 == 0b010) assert(try leb.readULEB128(u32, self.c_reader) == 0);
+                if (flags & 0b010 == 0b010) assert(try self.readULEB128(u32) == 0);
 
-                const opcode: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+                const opcode: wasm.Opcode = @enumFromInt(try self.readByte());
                 assert(opcode == .i32_const);
-                var offset: u32 = @intCast(try leb.readILEB128(i32, self.c_reader));
-                const end: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+                var offset: u32 = @intCast(try self.readILEB128(i32));
+                const end: wasm.Opcode = @enumFromInt(try self.readByte());
                 assert(end == .end);
 
                 const element_type = if (flags & 0b110 != 0b110) idx: {
-                    if (flags & 0b010 == 0b010) assert(try self.c_reader.readByte() == 0x00);
+                    if (flags & 0b010 == 0b010) assert(try self.readByte() == 0x00);
                     break :idx -0x10;
-                } else try leb.readILEB128(i33, self.c_reader);
+                } else try self.readILEB128(i33);
                 assert(element_type == -0x10);
 
-                var element_count = try leb.readULEB128(u32, self.c_reader);
+                var element_count = try self.readULEB128(u32);
                 while (element_count > 0) : ({
                     offset += 1;
                     element_count -= 1;
                 }) {
                     if (flags & 0b010 == 0b010)
-                        assert(try self.c_reader.readByte() == 0xD2);
-                    vm.table[offset] = try leb.readULEB128(u32, self.c_reader);
+                        assert(try self.readByte() == 0xD2);
+                    vm.table[offset] = try self.readULEB128(u32);
                     if (flags & 0b010 == 0b010) {
-                        const end_opcode: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+                        const end_opcode: wasm.Opcode = @enumFromInt(try self.readByte());
                         assert(end_opcode == .end);
                     }
                 }
             }
         }
+    }
 
+    fn readCodeSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.code);
         var max_frame_size: u64 = 0;
         {
-            vm.opcodes = try allocator.alloc(u8, 5000000);
-            vm.operands = try allocator.alloc(u32, 5000000);
+            vm.opcodes = try self.allocator.alloc(u8, 5000000);
+            vm.operands = try self.allocator.alloc(u32, 5000000);
 
-            assert(try leb.readULEB128(u32, self.c_reader) == vm.functions.len);
+            assert(try self.readULEB128(u32) == vm.functions.len);
             var pc = VM.ProgramCounter{ .opcode = 0, .operand = 0 };
             var stack: VM.StackInfo = undefined;
             for (vm.functions) |*func| {
-                _ = try leb.readULEB128(u32, self.c_reader);
+                _ = try self.readULEB128(u32);
 
                 stack = .{};
                 const type_info = vm.types[func.type_idx];
@@ -270,10 +310,10 @@ pub const ModuleReader = struct {
                 }
                 const params_size = stack.top_offset;
 
-                var local_sets_count = try leb.readULEB128(u32, self.c_reader);
+                var local_sets_count = try self.readULEB128(u32);
                 while (local_sets_count > 0) : (local_sets_count -= 1) {
-                    var local_set_count = try leb.readULEB128(u32, self.c_reader);
-                    const local_type = switch (try leb.readILEB128(i33, self.c_reader)) {
+                    var local_set_count = try self.readULEB128(u32);
+                    const local_type = switch (try self.readILEB128(i33)) {
                         -1, -3 => VM.StackInfo.EntryType.i32,
                         -2, -4 => VM.StackInfo.EntryType.i64,
                         else => unreachable,
@@ -302,8 +342,6 @@ pub const ModuleReader = struct {
                 }
             }
 
-            stats_log.debug("{} opcodes", .{pc.opcode});
-            stats_log.debug("{} operands", .{pc.operand});
             for (opcode_counts, 0..) |opcode_count, opcode| {
                 const last_opcode: usize = @intFromEnum(VM.Opcode.last);
                 if (opcode > last_opcode) continue;
@@ -311,33 +349,57 @@ pub const ModuleReader = struct {
                 stats_log.debug("{} {s}", .{ opcode_count, @tagName(opcode_enum) });
             }
         }
+    }
 
+    fn readDataSection(self: *ModuleReader, vm: *VirtualMachine) !void {
         try self.advance_to_section(.data);
         {
-            var segment_count = try leb.readULEB128(u32, self.c_reader);
+            var segment_count = try self.readULEB128(u32);
             while (segment_count > 0) : (segment_count -= 1) {
-                const flags = @as(u32, try leb.readULEB128(u32, self.c_reader));
+                const flags = @as(u32, try self.readULEB128(u32));
                 assert(flags & 0b001 == 0b000);
-                if (flags & 0b010 == 0b010) assert(try leb.readULEB128(u32, self.c_reader) == 0);
+                if (flags & 0b010 == 0b010) assert(try self.readULEB128(u32) == 0);
 
-                const i32_const: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+                const i32_const: wasm.Opcode = @enumFromInt(try self.readByte());
                 assert(i32_const == .i32_const);
 
-                const offset = @as(u32, @bitCast(try leb.readILEB128(i32, self.c_reader)));
-                const end: wasm.Opcode = @enumFromInt(try self.c_reader.readByte());
+                const offset = @as(u32, @bitCast(try self.readILEB128(i32)));
+                const end: wasm.Opcode = @enumFromInt(try self.readByte());
                 assert(end == .end);
 
-                const length = try leb.readULEB128(u32, self.c_reader);
+                const length = try self.readULEB128(u32);
                 try self.readNoEof(vm.memory[offset..][0..length]);
             }
         }
+    }
 
-        return start_fn_idx;
+    pub fn read(self: *ModuleReader, vm: *VirtualMachine) !u32 {
+        try self.readPreamble();
+        try self.readTypeSection(vm);
+        try self.readImportSection(vm);
+        try self.readFunctionSection(vm);
+        try self.readTableSection(vm);
+        try self.readMemorySection(vm);
+        try self.readGlobalsSection(vm);
+        try self.readExportsSection();
+        try self.readElementsSection(vm);
+        try self.readCodeSection(vm);
+        try self.readDataSection(vm);
+
+        return self.start_fn_idx;
+    }
+
+    pub fn dispose(self: *ModuleReader) void {
+        _ = std.c.fclose(self.c_reader.context);
     }
 };
 
-pub fn makeModuleReader(wasm_file: [*:0]const u8) !ModuleReader {
+pub fn makeModuleReader(allocator: std.mem.Allocator, wasm_file: [*:0]const u8) !ModuleReader {
     const module_file = std.c.fopen(wasm_file, "rb") orelse return error.FileNotFound;
-    // defer _ = std.c.fclose(module_file);
-    return .{ .c_reader = .{ .context = module_file } };
+    return .{
+        .c_reader = .{
+            .context = module_file,
+        },
+        .allocator = allocator,
+    };
 }
