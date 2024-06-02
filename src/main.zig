@@ -17,21 +17,6 @@ const func_log = std.log.scoped(.func);
 const SEEK = enum(c_int) { SET, CUR, END };
 pub extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: SEEK) c_int;
 
-pub fn log(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    if (scope == .decode) return;
-    if (scope == .stats) return;
-    if (scope == .cpu) return;
-    if (scope == .trace) return;
-    if (scope == .func) return;
-    std.debug.print(format ++ "\n", args);
-    _ = level;
-}
-
 const max_memory = 3 * 1024 * 1024; // 3 MiB
 
 pub export fn main(argc: c_int, argv: [*c][*:0]u8) c_int {
