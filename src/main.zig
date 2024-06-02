@@ -32,43 +32,29 @@ pub fn log(
     _ = level;
 }
 
-const max_memory = 3 * 1024 * 1024 * 1024; // 3 GiB
+const max_memory = 3 * 1024 * 1024; // 3 MiB
 
 pub export fn main(argc: c_int, argv: [*c][*:0]u8) c_int {
-    main2(argv[0..@intCast(argc)]) catch |e| std.debug.print("{s}\n", .{@errorName(e)});
+    main2(argv[0..@intCast(argc)]) catch |e| {
+        std.debug.print("{s}\n", .{@errorName(e)});
+    };
     return 1;
 }
 
 fn main2(args: []const [*:0]const u8) !void {
+    if (args.len < 2) {
+        std.debug.print("Usage: zig-wasi <file.wasm>\n", .{});
+        std.process.exit(1);
+    }
+
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.raw_c_allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
     var vm: VirtualMachine = undefined;
-    vm.memory = try std.posix.mmap(
-        null,
-        max_memory,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
+    vm.memory = try arena.alloc(u8, max_memory);
 
-    const zig_lib_dir_path = args[1];
-    const zig_cache_dir_path = mem.sliceTo(args[2], 0);
-    vm.args = args[3..];
-    const wasm_file = vm.args[0];
-
-    const cwd = try fs.cwd().openDir(".", .{});
-    const cache_dir = try cwd.makeOpenPath(zig_cache_dir_path, .{});
-    const zig_lib_dir = try cwd.openDirZ(zig_lib_dir_path, .{});
-
-    addPreopen(0, "stdin", std.posix.STDIN_FILENO);
-    addPreopen(1, "stdout", std.posix.STDOUT_FILENO);
-    addPreopen(2, "stderr", std.posix.STDERR_FILENO);
-    addPreopen(3, ".", cwd.fd);
-    addPreopen(4, "/cache", cache_dir.fd);
-    addPreopen(5, "/lib", zig_lib_dir.fd);
+    const wasm_file = args[1];
 
     var start_fn_idx: u32 = undefined;
     var section_type: wasm.Section = undefined;

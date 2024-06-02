@@ -6,7 +6,12 @@ pub fn build(b: *Build) void {
 
     const executable = b.addExecutable(.{
         .name = "zig-wasi",
-        .root_source_file = .{ .path = "src/main.zig" },
+        .root_source_file = .{
+            .src_path = .{
+                .owner = b,
+                .sub_path = "src/main.zig",
+            },
+        },
         .link_libc = true,
         .target = target,
         .optimize = optimize,
