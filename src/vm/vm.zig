@@ -38,13 +38,7 @@ pub const VirtualMachine = struct {
     args: []const [*:0]const u8,
     table: []u32,
 
-    pub fn decodeCode(
-        vm: *VirtualMachine,
-        reader: anytype,
-        func_type_info: TypeInfo,
-        pc: *ProgramCounter,
-        stack: *StackInfo,
-    ) !void {
+    pub fn decodeCode(vm: *VirtualMachine, reader: anytype, func_type_info: TypeInfo, pc: *ProgramCounter, stack: *StackInfo) !void {
         const opcodes = vm.opcodes;
         const operands = vm.operands;
 

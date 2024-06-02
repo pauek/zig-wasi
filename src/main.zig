@@ -1,6 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
-const read_module = @import("./read_module.zig").read_module;
+const read_module = @import("./reader.zig").read_module;
 const vm = @import("./vm/vm.zig");
 
 fn usage() void {
