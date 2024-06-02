@@ -41,7 +41,7 @@ const CReader = std.io.Reader(*std.c.FILE, std.fs.File.ReadError, c_reader_read)
 pub const ModuleReader = struct {
     c_reader: CReader,
 
-    fn goto_section(self: *ModuleReader, section: wasm.Section) !void {
+    fn advance_to_section(self: *ModuleReader, section: wasm.Section) !void {
         const section_type: wasm.Section = @enumFromInt(try self.c_reader.readByte());
         while (section_type != section)
             assert(fseek(
@@ -52,17 +52,25 @@ pub const ModuleReader = struct {
         _ = try leb.readULEB128(u32, self.c_reader);
     }
 
+    pub inline fn readNoEof(self: *ModuleReader, buf: []u8) !void {
+        try self.c_reader.readNoEof(buf);
+    }
+
+    pub inline fn readVarInt(self: *ModuleReader, comptime ReturnType: type, endian: std.builtin.Endian, size: usize) !ReturnType {
+        return self.c_reader.readVarInt(ReturnType, endian, size);
+    }
+
     pub fn read(self: *ModuleReader, allocator: std.mem.Allocator, vm: *VirtualMachine) !u32 {
         var start_fn_idx: u32 = undefined;
 
         var magic: [4]u8 = undefined;
-        try self.c_reader.readNoEof(&magic);
+        try self.readNoEof(&magic);
         if (!mem.eql(u8, &magic, "\x00asm")) return error.NotWasm;
 
-        const version = try self.c_reader.readVarInt(u32, std.builtin.Endian.little, 1);
+        const version = try self.readVarInt(u32, std.builtin.Endian.little, 1);
         if (version != 1) return error.BadWasmVersion;
 
-        try self.goto_section(.type);
+        try self.advance_to_section(.type);
 
         var max_param_count: u64 = 0;
         vm.types = try allocator.alloc(VM.TypeInfo, try leb.readULEB128(u32, self.c_reader));
@@ -97,7 +105,7 @@ pub const ModuleReader = struct {
             }
         }
 
-        try self.goto_section(.import);
+        try self.advance_to_section(.import);
         {
             vm.imports = try allocator.alloc(VM.Import, try leb.readULEB128(u32, self.c_reader));
 
@@ -111,11 +119,11 @@ pub const ModuleReader = struct {
 
             for (vm.imports) |*import| {
                 const mod = str_buf[0..try leb.readULEB128(u32, self.c_reader)];
-                try self.c_reader.readNoEof(mod);
+                try self.readNoEof(mod);
                 import.mod = std.meta.stringToEnum(VM.Import.Mod, mod).?;
 
                 const name = str_buf[0..try leb.readULEB128(u32, self.c_reader)];
-                try self.c_reader.readNoEof(name);
+                try self.readNoEof(name);
                 import.name = std.meta.stringToEnum(VM.Import.Name, name).?;
 
                 const kind: wasm.ExternalKind = @enumFromInt(try self.c_reader.readByte());
@@ -127,7 +135,7 @@ pub const ModuleReader = struct {
             }
         }
 
-        try self.goto_section(.function);
+        try self.advance_to_section(.function);
         vm.functions = try allocator.alloc(VM.Function, try leb.readULEB128(u32, self.c_reader));
         for (vm.functions, 0..) |*function, func_idx| {
             const len: u32 = @truncate(vm.imports.len);
@@ -136,7 +144,7 @@ pub const ModuleReader = struct {
             function.type_idx = try leb.readULEB128(u32, self.c_reader);
         }
 
-        try self.goto_section(.table);
+        try self.advance_to_section(.table);
         {
             const table_count = try leb.readULEB128(u32, self.c_reader);
             if (table_count == 1) {
@@ -151,7 +159,7 @@ pub const ModuleReader = struct {
             } else assert(table_count == 0);
         }
 
-        try self.goto_section(.memory);
+        try self.advance_to_section(.memory);
         {
             assert(try leb.readULEB128(u32, self.c_reader) == 1);
             const limits_kind = try self.c_reader.readByte();
@@ -163,7 +171,7 @@ pub const ModuleReader = struct {
             }
         }
 
-        try self.goto_section(.global);
+        try self.advance_to_section(.global);
         vm.globals = try allocator.alloc(u32, try leb.readULEB128(u32, self.c_reader));
         for (vm.globals) |*global| {
             assert(try leb.readILEB128(i33, self.c_reader) == -1);
@@ -175,7 +183,7 @@ pub const ModuleReader = struct {
             assert(opcode == .end);
         }
 
-        try self.goto_section(.@"export");
+        try self.advance_to_section(.@"export");
         {
             var found_start_fn = false;
             const start_name = "_start";
@@ -186,7 +194,7 @@ pub const ModuleReader = struct {
                 const name_len = try leb.readULEB128(u32, self.c_reader);
                 var is_start_fn = false;
                 if (name_len == start_name.len) {
-                    try self.c_reader.readNoEof(&str_buf);
+                    try self.readNoEof(&str_buf);
                     is_start_fn = mem.eql(u8, &str_buf, start_name);
                     found_start_fn = found_start_fn or is_start_fn;
                 } else assert(fseek(self.c_reader.context, @as(c_long, name_len), .CUR) == 0);
@@ -203,7 +211,7 @@ pub const ModuleReader = struct {
             assert(found_start_fn);
         }
 
-        try self.goto_section(.element);
+        try self.advance_to_section(.element);
         {
             var segment_count = try leb.readULEB128(u32, self.c_reader);
             while (segment_count > 0) : (segment_count -= 1) {
@@ -239,7 +247,7 @@ pub const ModuleReader = struct {
             }
         }
 
-        try self.goto_section(.code);
+        try self.advance_to_section(.code);
         var max_frame_size: u64 = 0;
         {
             vm.opcodes = try allocator.alloc(u8, 5000000);
@@ -304,7 +312,7 @@ pub const ModuleReader = struct {
             }
         }
 
-        try self.goto_section(.data);
+        try self.advance_to_section(.data);
         {
             var segment_count = try leb.readULEB128(u32, self.c_reader);
             while (segment_count > 0) : (segment_count -= 1) {
@@ -320,7 +328,7 @@ pub const ModuleReader = struct {
                 assert(end == .end);
 
                 const length = try leb.readULEB128(u32, self.c_reader);
-                try self.c_reader.readNoEof(vm.memory[offset..][0..length]);
+                try self.readNoEof(vm.memory[offset..][0..length]);
             }
         }
 
